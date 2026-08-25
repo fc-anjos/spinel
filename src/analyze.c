@@ -13897,6 +13897,9 @@ void analyze_program(Compiler *c) {
       LocalVar *wv = scope_local(sc2, wn);
       if (!rv || !wv || rv->type == wv->type) continue;
       if (!ty_is_array(rv->type) && rv->type != TY_POLY) continue;
+      /* a local already unified to poly holds other kinds too
+         (`r = x.pop; r = x.concat([3])`); it stays poly */
+      if (!ty_is_array(wv->type)) continue;
       wv->type = rv->type;
       c->ntype[v] = rv->type;
       NT_FOREACH_KIND(c->nt, NK_LocalVariableReadNode, rid) {
