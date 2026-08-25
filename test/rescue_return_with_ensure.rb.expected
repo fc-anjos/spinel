@@ -1,0 +1,11 @@
+ensure ran
+"r:x"
+ensure ran
+"else"
+[-1, 2, -2, -3]
+inner ensure
+outer ensure
+"inner-rescue"
+"boom"
+-1
+"modifier"

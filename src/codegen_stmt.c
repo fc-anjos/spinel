@@ -5097,10 +5097,10 @@ void emit_return(Compiler *c, int id, Buf *b, int indent) {
       }
     }
     {
+      /* inside a rescue/else clause the region's frame is already popped, so
+         0 is a valid count; popping one anyway takes a caller's handler */
       int pops = g_exc_frame_depth - ctx->exc_base;
-      if (pops < 1) pops = 1;   /* at least the ensure frame itself */
-      /* pop the handlers for rescue bodies inside this ensure region we are
-         leaving; rescues outside it are popped at the ensure re-dispatch. */
+      if (pops < 0) pops = 0;
       emit_cur_exc_restore(b, ctx->exc_base);
       buf_printf(b, "_retf%d = 1; sp_exc_top -= %d; goto _ensure%d; }\n",
                  ctx->lid, pops, ctx->lid);
@@ -9072,7 +9072,7 @@ else {
     if (g_ensure_depth > g_loop_ensure_base) {
       EnsureCtx *nctx = &g_ensure_stack[g_ensure_depth - 1];
       int npops = g_exc_frame_depth - nctx->exc_base;
-      if (npops < 1) npops = 1;
+      if (npops < 0) npops = 0;   /* see emit_return */
       emit_indent(b, indent);
       buf_puts(b, "{ ");
       emit_cur_exc_restore(b, nctx->exc_base);
