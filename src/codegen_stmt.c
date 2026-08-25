@@ -2502,7 +2502,8 @@ static void emit_pm_typed_assign(Scope *sc, const char *lnm,
   else if (ty == TY_INT_ARRAY)            buf_printf(b, "(sp_IntArray *)(%s).v.p", boxed);
   else if (ty == TY_FLOAT_ARRAY)          buf_printf(b, "(sp_FloatArray *)(%s).v.p", boxed);
   else if (ty == TY_STR_ARRAY)            buf_printf(b, "(sp_StrArray *)(%s).v.p", boxed);
-  else if (ty == TY_POLY_ARRAY)           buf_printf(b, "(sp_PolyArray *)(%s).v.p", boxed);
+  /* the slice keeps the scrutinee's kind, which may be a typed array */
+  else if (ty == TY_POLY_ARRAY)           buf_printf(b, "sp_poly_to_a_arr(%s)", boxed);
   else if (ty == TY_STRING)               buf_printf(b, "(%s).v.s", boxed);
   else                                    buf_puts(b, boxed);  /* poly: direct */
   buf_puts(b, ";\n");
