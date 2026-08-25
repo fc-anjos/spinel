@@ -518,6 +518,7 @@ const char *sp_re_literal_error(const char *src, int len, int flags);
    or 0 if the name is not a recognized builtin class. */
 int builtin_class_id(const char *name);
 int is_builtin_class_name(const char *n);
+int is_builtin_module_name(const char *n);
 int is_builtin_exception_name(const char *n);
 const char *c_type_name(TyKind t);
 int is_scalar_ret(TyKind t);

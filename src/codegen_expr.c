@@ -2470,16 +2470,15 @@ else {
       else_stmts = nt_ref(nt, sub, "statements");
     int en = 0;
     const int *eb = else_stmts >= 0 ? nt_arr(nt, else_stmts, "body", &en) : NULL;
-    /* A statically-answered defined? predicate folds to its live arm alone:
-       the dead arm may reference the very constant defined? reported on (and
-       its NameError-raise value would not type-unify with the live arm), and
-       CRuby never evaluates it. Mirrors emit_if's statement-form fold and
-       the matching inference fold. */
+    /* A statically-answered defined? or is_a? predicate folds to its live arm:
+       the dead arm may not even type-check against the receiver's storage
+       type. Mirrors emit_if's statement-form fold and the inference fold. */
     {
       int df = comp_defined_guard_false(c, pred);
       int dt = df ? 0 : comp_defined_guard_true(c, pred);
-      if (df || dt) {
-        int take_then = is_unless ? df : dt;
+      int known = df ? 0 : (dt ? 1 : static_isa_cond(c, pred));
+      if (known >= 0) {
+        int take_then = is_unless ? !known : known;
         if (!take_then && !is_unless && sub >= 0 && nt_type(nt, sub) &&
             sp_streq(nt_type(nt, sub), "IfNode")) {
           emit_expr(c, sub, b);  /* the elsif chain continues as the value */

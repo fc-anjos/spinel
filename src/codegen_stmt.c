@@ -1461,8 +1461,19 @@ int static_isa_cond(Compiler *c, int pred) {
   int args = nt_ref(nt, pred, "arguments");
   int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
   if (ac != 1 || !av || !nt_type(nt, av[0]) || !sp_streq(nt_type(nt, av[0]), "ConstantReadNode")) return -1;
-  const char *tname = nt_str(nt, av[0], "name");
-  int target = comp_class_index(c, tname);
+  const char *target_name = nt_str(nt, av[0], "name");
+  if (!target_name) return -1;
+  /* A scalar local against a builtin class is answered from its type. Not a
+     bool (TrueClass/FalseClass depends on the value), not a Queue (shares its
+     runtime object with SizedQueue), and only a local read so no receiver
+     evaluation is dropped. */
+  if (!ty_is_object(rt) && rt != TY_BOOL && rt != TY_QUEUE && rt != TY_UNKNOWN &&
+      (is_builtin_class_name(target_name) || is_builtin_module_name(target_name))) {
+    const char *rnt = nt_type(nt, recv);
+    if (!rnt || !sp_streq(rnt, "LocalVariableReadNode")) return -1;
+    return ty_matches_class(rt, target_name, sp_streq(nm, "instance_of?"));
+  }
+  int target = comp_class_index(c, target_name);
   if (target < 0) return -1;
   /* A number/symbol/bool is never an instance of a user class, so the arm that
      reads it as one is dead -- and it is the only place a call like
@@ -1473,7 +1484,7 @@ int static_isa_cond(Compiler *c, int pred) {
   if (!ty_is_object(rt) && !ty_is_array(rt) && !ty_is_hash(rt) &&
       (rt == TY_INT || rt == TY_BIGINT || rt == TY_FLOAT || rt == TY_BOOL ||
        rt == TY_SYMBOL || rt == TY_STRING) &&
-      tname && !is_builtin_class_name(tname)) {
+      target_name && !is_builtin_class_name(target_name)) {
     for (int k = 0; k < c->nclasses; k++) {
       if (!c->classes[k].name || !is_builtin_class_name(c->classes[k].name)) continue;
       for (int m = 0; m < c->classes[k].nincluded_mods; m++)
