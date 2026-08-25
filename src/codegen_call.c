@@ -17247,9 +17247,11 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
       nt_ref(nt, id, "block") < 0) {
     buf_puts(b, "({ ");
     if (argc == 0 && sp_streq(name, "puts")) buf_puts(b, "putchar('\n');\n");
-    for (int k = 0; k < argc; k++) {
-      if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
-      else emit_print_one(c, argv[k], b, 0);
+    if (!emit_output_spilled(c, name, argc, argv, b, 0)) {
+      for (int k = 0; k < argc; k++) {
+        if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
+        else emit_print_one(c, argv[k], b, 0);
+      }
     }
     buf_puts(b, " sp_box_nil(); })");
     return;

@@ -3932,16 +3932,21 @@ static sp_RbVal sp_fmt_named_ref(sp_PolyArray *a, const char *nm, char nclose, c
 /* Splat arguments into the print builtins: puts(*a) / print(*a) / p(*a)
    expand each element of the (any-kind) array as its own argument. puts
    recurses into array elements, as CRuby does. */
-static void sp_splat_puts(sp_RbVal a) {
+/* puts over an argument list: arrays flatten, an empty one writes nothing */
+static void sp_puts_elems(sp_RbVal a) {
   sp_int n = sp_poly_arr_len(a);
-  if (n == 0) { putchar(10); return; }
   for (sp_int i = 0; i < n; i++) {
     sp_RbVal e = sp_poly_arr_get(a, i);
-    if (e.tag == SP_TAG_OBJ && sp_poly_is_array_kind(e.cls_id)) { sp_splat_puts(e); continue; }
+    if (e.tag == SP_TAG_OBJ && sp_poly_is_array_kind(e.cls_id)) { sp_puts_elems(e); continue; }
     const char *s = sp_poly_to_s(e);
     if (s) fputs(s, stdout);
     if (!s || !*s || s[strlen(s) - 1] != 10) putchar(10);
   }
+}
+/* `puts *arr`: an empty array is a bare `puts` */
+static void sp_splat_puts(sp_RbVal a) {
+  if (sp_poly_arr_len(a) == 0) { putchar(10); return; }
+  sp_puts_elems(a);
 }
 static void sp_splat_print(sp_RbVal a) {
   sp_int n = sp_poly_arr_len(a);

@@ -583,6 +583,53 @@ void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   }
 }
 
+/* Ruby evaluates every puts / print / p argument before writing any. The
+   per-argument emitters interleave evaluation and output, which is only
+   observable when a later argument has side effects; then box all arguments
+   first and print the array. Returns 0 when the per-argument path is fine. */
+int emit_output_spilled(Compiler *c, const char *name, int argc, const int *argv, Buf *b, int indent) {
+  if (argc < 2) return 0;
+  int effectful = 0;
+  for (int k = 1; k < argc && !effectful; k++) {
+    int a = argv[k];
+    if (nt_type(c->nt, a) && sp_streq(nt_type(c->nt, a), "SplatNode")) a = nt_ref(c->nt, a, "expression");
+    if (a >= 0 && subtree_has_side_effect(c, a)) effectful = 1;
+  }
+  if (!effectful) return 0;
+  int t = ++g_tmp;
+  emit_indent(b, indent);
+  buf_printf(b, "{ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);\n", t, t);
+  for (int k = 0; k < argc; k++) {
+    int a = argv[k];
+    /* an argument's hoisted prelude (`st.add(2).size`) must run right before
+       its own push, not before the whole array build */
+    Buf apre, abody; memset(&apre, 0, sizeof apre); memset(&abody, 0, sizeof abody);
+    Buf *sv_pre = g_pre; int sv_ind = g_indent;
+    g_pre = &apre; g_indent = indent + 2;
+    if (nt_type(c->nt, a) && sp_streq(nt_type(c->nt, a), "SplatNode")) {
+      int sx = nt_ref(c->nt, a, "expression");
+      buf_printf(&abody, "sp_PolyArray_concat_into(_t%d, ", t);
+      if (sx >= 0) emit_boxed(c, sx, &abody); else buf_puts(&abody, "sp_box_nil()");
+      buf_puts(&abody, ");\n");
+    }
+    else {
+      buf_printf(&abody, "sp_PolyArray_push(_t%d, ", t); emit_boxed(c, a, &abody); buf_puts(&abody, ");\n");
+    }
+    g_pre = sv_pre; g_indent = sv_ind;
+    if (apre.p) buf_puts(b, apre.p);
+    emit_indent(b, indent + 2);
+    if (abody.p) buf_puts(b, abody.p);
+    free(apre.p); free(abody.p);
+  }
+  emit_indent(b, indent + 2);
+  if (sp_streq(name, "puts"))       buf_printf(b, "sp_puts_elems(sp_box_poly_array(_t%d));\n", t);
+  else if (sp_streq(name, "print")) buf_printf(b, "sp_splat_print(sp_box_poly_array(_t%d));\n", t);
+  else buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
+                     "fputs(sp_poly_inspect(_t%d->data[_i%d]), stdout); putchar('\\n'); }\n", t, t, t, t, t, t);
+  emit_indent(b, indent); buf_puts(b, "}\n");
+  return 1;
+}
+
 int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -597,6 +644,9 @@ int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   const int *argv = NULL;
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
 
+  if (sp_streq(name, "puts") || sp_streq(name, "print") || sp_streq(name, "p") || sp_streq(name, "pp")) {
+    if (emit_output_spilled(c, name, argc, argv, b, indent)) return 1;
+  }
   if (sp_streq(name, "puts")) {
     if (argc == 0) { emit_indent(b, indent); buf_puts(b, "putchar('\\n');\n"); return 1; }
     for (int k = 0; k < argc; k++) emit_puts_one(c, argv[k], b, indent);
