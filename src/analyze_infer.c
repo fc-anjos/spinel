@@ -168,7 +168,15 @@ TyKind ie_block_break_next_ty(Compiler *c, int node) {
   if (sp_streq(ty, "BreakNode") || sp_streq(ty, "NextNode")) {
     int a = nt_ref(nt, node, "arguments"); int an = 0;
     const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
-    return an > 0 ? infer_type(c, av[0]) : TY_UNKNOWN;
+    if (an > 0) {
+      /* `next *x` delivers the splat-built ARRAY, not the element type that
+         infer_type reports for a SplatNode in an array literal. */
+      const char *aty = nt_type(nt, av[0]);
+      if (aty && sp_streq(aty, "SplatNode")) return TY_POLY_ARRAY;
+      return infer_type(c, av[0]);
+    }
+    /* a bare `next` yields nil: `[1,2].map { |v| next if v == 1; v }` is [nil, 2] */
+    return sp_streq(ty, "NextNode") ? TY_NIL : TY_UNKNOWN;
   }
   if (sp_streq(ty, "WhileNode") || sp_streq(ty, "UntilNode") || sp_streq(ty, "ForNode") ||
       sp_streq(ty, "BlockNode") || sp_streq(ty, "LambdaNode") || sp_streq(ty, "DefNode") ||
@@ -4259,6 +4267,8 @@ else {
           int body = nt_ref(nt, blk, "body");
           int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
           TyKind et = bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN;
+          TyKind bnt = ie_block_break_next_ty(c, body);
+          if (bnt != TY_UNKNOWN) et = (et == TY_UNKNOWN) ? bnt : ty_unify(et, bnt);
           return et != TY_UNKNOWN ? ty_array_of(et) : TY_POLY_ARRAY;
         }
       }
@@ -4620,7 +4630,10 @@ else {
       int body = nt_ref(nt, block, "body");
       int bn = 0;
       const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-      return ty_array_of(bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN);
+      TyKind et = bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN;
+      TyKind bnt = ie_block_break_next_ty(c, body);
+      if (bnt != TY_UNKNOWN) et = (et == TY_UNKNOWN) ? bnt : ty_unify(et, bnt);
+      return ty_array_of(et);
     }
   }
 
