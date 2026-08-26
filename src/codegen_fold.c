@@ -6388,6 +6388,19 @@ int kwh_positional_slot(Compiler *c, Scope *m, int kwh, int pos_argc) {
    reimplementing the test. */
 int rest_kwh_tail(Compiler *c, Scope *m, int kwh, int pos_argc) {
   if (kwh < 0 || !m || m->kwrest_idx >= 0) return -1;
+  /* An anonymous `**` is the enclosing forwarding method's keyword hash, so
+     it feeds declared keyword params even though there is no literal key to
+     find. It must not be packed into the positional rest as a hash (and its
+     source node has no expression to render). */
+  int en0 = 0; const int *el0 = nt_arr(c->nt, kwh, "elements", &en0);
+  int anon_ds = 0;
+  for (int e = 0; e < en0; e++)
+    if (nt_kind(c->nt, el0[e]) == NK_AssocSplatNode &&
+        nt_ref(c->nt, el0[e], "value") < 0) { anon_ds = 1; break; }
+  if (anon_ds) {
+    int kn = 0; nt_arr(c->nt, nt_ref(c->nt, m->def_node, "parameters"), "keywords", &kn);
+    if (kn > 0) return -1;
+  }
   for (int i = 0; i < m->nparams; i++)
     if (m->pnames[i] && callee_has_kwarg(c, m, m->pnames[i]) &&
         kwh_lookup(c->nt, kwh, m->pnames[i]) >= 0) return -1;   /* a keyword param takes it */
@@ -6397,6 +6410,25 @@ int rest_kwh_tail(Compiler *c, Scope *m, int kwh, int pos_argc) {
      Ruby leaves it empty (found while fixing #4030). */
   if (kwh_positional_slot(c, m, kwh, pos_argc) >= 0) return -1;
   return kwh;
+}
+
+/* Positional arity excludes declared keyword parameters, which are stored in
+   the same pnames[] array as positional parameters. This matters when an
+   anonymous `*` from a forwarding wrapper is expanded into a fixed callee:
+   `def f(x, k:)` has one positional slot, not two. */
+static void positional_arity(Compiler *c, Scope *m, int *required, int *total) {
+  int pn = m ? nt_ref(c->nt, m->def_node, "parameters") : -1;
+  if (pn >= 0) {
+    int rn = 0, on = 0, postn = 0;
+    nt_arr(c->nt, pn, "requireds", &rn);
+    nt_arr(c->nt, pn, "optionals", &on);
+    nt_arr(c->nt, pn, "posts", &postn);
+    *required = rn + postn;
+    *total = rn + on + postn;
+    return;
+  }
+  *required = m ? m->nrequired : 0;
+  *total = m ? m->nparams : 0;
 }
 
 /* Did a declared keyword parameter take one of this hash's keys? If so the
@@ -7130,37 +7162,49 @@ void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const char *lea
         splat_idx = k;
         int inner = nt_ref(nt, argv[k], "expression");
         splat_at = inner >= 0 ? comp_ntype(c, inner) : TY_UNKNOWN;
-        if (ty_is_array(splat_at) || splat_at == TY_POLY_ARRAY) {
+        Buf anon; memset(&anon, 0, sizeof anon);
+        int is_anon = inner < 0 && emit_anon_rest_ref(c, argv[k], &anon);
+        if (is_anon) splat_at = TY_POLY_ARRAY;
+        if (is_anon || ty_is_array(splat_at) || splat_at == TY_POLY_ARRAY) {
           splat_tmp = ++g_tmp;
           /* Evaluate the splat operand into a side buffer: a literal array or a
              call result emits its own setup (a fresh `_tN = ..._new()` decl)
              into g_pre, which must land before this temp's declaration line --
              a bare local read has no setup, which is why those already worked. */
-          Buf sb; memset(&sb, 0, sizeof sb);
-          emit_expr(c, inner, &sb);
           emit_indent(g_pre, g_indent);
-          emit_ctype(c, splat_at, g_pre);
-          buf_printf(g_pre, " _t%d = %s;\n", splat_tmp, sb.p ? sb.p : "");
+          if (is_anon) {
+            buf_printf(g_pre, "sp_PolyArray *_t%d = %s;\n", splat_tmp,
+                       anon.p ? anon.p : "sp_PolyArray_new()");
+          }
+          else {
+            Buf sb; memset(&sb, 0, sizeof sb);
+            emit_expr(c, inner, &sb);
+            emit_ctype(c, splat_at, g_pre);
+            buf_printf(g_pre, " _t%d = %s;\n", splat_tmp, sb.p ? sb.p : "");
+            free(sb.p);
+          }
           emit_indent(g_pre, g_indent);
           buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", splat_tmp);
-          free(sb.p);
+          free(anon.p);
           /* Arity check: splatting into a fixed-arity (no-rest) method must
              supply a valid element count, else CRuby raises ArgumentError.
              Only emit when the splat is the last positional group, so the
              total given count is `splat_idx + array length`. */
           if (m->rest_idx < 0 && k == pos_argc - 1) {
+            int pos_required = 0, pos_params = 0;
+            positional_arity(c, m, &pos_required, &pos_params);
             char expbuf[48];
-            if (m->nrequired == m->nparams)
-              snprintf(expbuf, sizeof expbuf, "expected %d", m->nparams);
+            if (pos_required == pos_params)
+              snprintf(expbuf, sizeof expbuf, "expected %d", pos_params);
             else
-              snprintf(expbuf, sizeof expbuf, "expected %d..%d", m->nrequired, m->nparams);
+              snprintf(expbuf, sizeof expbuf, "expected %d..%d", pos_required, pos_params);
             int gv = ++g_tmp;
             emit_indent(g_pre, g_indent);
             buf_printf(g_pre, "sp_int _t%d = %d + (_t%d ? _t%d->len : 0);\n", gv, splat_idx, splat_tmp, splat_tmp);
             emit_indent(g_pre, g_indent);
             buf_printf(g_pre,
                        "if (_t%d < %d || _t%d > %d) sp_raise_cls(\"ArgumentError\", sp_sprintf(\"wrong number of arguments (given %%lld, %s)\", (long long)_t%d));\n",
-                       gv, m->nrequired, gv, m->nparams, expbuf, gv);
+                       gv, pos_required, gv, pos_params, expbuf, gv);
           }
         }
       }
@@ -7588,32 +7632,44 @@ void emit_dispatch(Compiler *c, int cid, const char *name,
         k < m->nparams) {
       int inner = nt_ref(nt, argv[k], "expression");
       splat_at_d = inner >= 0 ? comp_ntype(c, inner) : TY_UNKNOWN;
-      if (ty_is_array(splat_at_d) || splat_at_d == TY_POLY_ARRAY) {
+      Buf anon; memset(&anon, 0, sizeof anon);
+      int is_anon = inner < 0 && emit_anon_rest_ref(c, argv[k], &anon);
+      if (is_anon) splat_at_d = TY_POLY_ARRAY;
+      if (is_anon || ty_is_array(splat_at_d) || splat_at_d == TY_POLY_ARRAY) {
         splat_idx_d = k;
         splat_tmp_d = ++g_tmp;
-        Buf sb; memset(&sb, 0, sizeof sb);
-        emit_expr(c, inner, &sb);
         emit_indent(g_pre, g_indent);
-        emit_ctype(c, splat_at_d, g_pre);
-        buf_printf(g_pre, " _t%d = %s;\n", splat_tmp_d, sb.p ? sb.p : "");
+        if (is_anon) {
+          buf_printf(g_pre, "sp_PolyArray *_t%d = %s;\n", splat_tmp_d,
+                     anon.p ? anon.p : "sp_PolyArray_new()");
+        }
+        else {
+          Buf sb; memset(&sb, 0, sizeof sb);
+          emit_expr(c, inner, &sb);
+          emit_ctype(c, splat_at_d, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", splat_tmp_d, sb.p ? sb.p : "");
+          free(sb.p);
+        }
         emit_indent(g_pre, g_indent);
         buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", splat_tmp_d);
-        free(sb.p);
+        free(anon.p);
         /* Arity check when the splat is the last positional group: the total
            given count is splat_idx + array length. */
         if (k == pos_argc_d - 1) {
+          int pos_required = 0, pos_params = 0;
+          positional_arity(c, m, &pos_required, &pos_params);
           char expbuf[48];
-          if (m->nrequired == m->nparams)
-            snprintf(expbuf, sizeof expbuf, "expected %d", m->nparams);
+          if (pos_required == pos_params)
+            snprintf(expbuf, sizeof expbuf, "expected %d", pos_params);
           else
-            snprintf(expbuf, sizeof expbuf, "expected %d..%d", m->nrequired, m->nparams);
+            snprintf(expbuf, sizeof expbuf, "expected %d..%d", pos_required, pos_params);
           int gv = ++g_tmp;
           emit_indent(g_pre, g_indent);
           buf_printf(g_pre, "sp_int _t%d = %d + (_t%d ? _t%d->len : 0);\n", gv, splat_idx_d, splat_tmp_d, splat_tmp_d);
           emit_indent(g_pre, g_indent);
           buf_printf(g_pre,
                      "if (_t%d < %d || _t%d > %d) sp_raise_cls(\"ArgumentError\", sp_sprintf(\"wrong number of arguments (given %%lld, %s)\", (long long)_t%d));\n",
-                     gv, m->nrequired, gv, m->nparams, expbuf, gv);
+                     gv, pos_required, gv, pos_params, expbuf, gv);
         }
       }
       break;
