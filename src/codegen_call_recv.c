@@ -5442,6 +5442,7 @@ else {
             tn = ++g_tmp, ti = ++g_tmp, tk = ++g_tmp, tv = ++g_tmp;
         buf_printf(b, "({ sp_PolyPolyHash *_t%d = sp_PolyPolyHash_new(); SP_GC_ROOT(_t%d);", tr, tr);
         buf_printf(b, " sp_PolyPolyHash *_t%d = ", tc); emit_expr(c, recv, b); buf_puts(b, ";");
+        buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, tc, tr, tc, tr, tc);
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {"
                       " sp_int _ix = _t%d->order[_t%d];"
                       " sp_PolyPolyHash_set(_t%d, _t%d->keys[_ix], _t%d->vals[_ix]); }",
@@ -5500,6 +5501,9 @@ else {
         buf_printf(b, "({ %s _t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);", c_type_name(rt), tr, hn, tr);
         /* copy the receiver into the fresh result */
         buf_printf(b, " %s _t%d = ", c_type_name(rt), tc); emit_expr(c, recv, b); buf_puts(b, ";");
+        buf_printf(b, " _t%d->default_v = _t%d->default_v;", tr, tc);
+        if (vt == TY_POLY)
+          buf_printf(b, " _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, tc, tr, tc);
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++)"
                       " sp_%sHash_set(_t%d, _t%d->order[_t%d], sp_%sHash_get(_t%d, _t%d->order[_t%d]));",
                    tj, tj, tc, tj, hn, tr, tc, tj, hn, tc, tc, tj);
@@ -5662,6 +5666,14 @@ else {
         buf_printf(b, "({ sp_%sHash *_t%d = sp_%sHash_dup(", hn, t, hn);
         emit_expr(c, recv, b);
         buf_printf(b, "); SP_GC_ROOT(_t%d);", t);
+        /* except answers a fresh hash: no default, no default proc */
+        {
+          TyKind evt = ty_hash_val(rt);
+          if (evt == TY_POLY)
+            buf_printf(b, " _t%d->default_v = sp_box_nil(); _t%d->dproc = NULL; _t%d->dproc_self = NULL;", t, t, t);
+          else if (evt == TY_STRING) buf_printf(b, " _t%d->default_v = NULL;", t);
+          else buf_printf(b, " _t%d->default_v = SP_INT_NIL;", t);
+        }
         for (int i = 0; i < argc; i++) {
           /* a splatted key list deletes each of its members (#3561) */
           if (nt_type(nt, argv[i]) && sp_streq(nt_type(nt, argv[i]), "SplatNode")) {
@@ -5933,6 +5945,8 @@ else {
           int th = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
           buf_printf(b, "({ sp_PolyPolyHash *_t%d = ", th); emit_expr(c, recv, b);
           buf_printf(b, "; sp_PolyPolyHash *_t%d = sp_PolyPolyHash_new(); SP_GC_ROOT(_t%d);", tr, tr);
+          /* compact keeps the default and default proc, like dup */
+          buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, th, tr, th, tr, th);
           buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {", ti, ti, th, ti);
           buf_printf(b, " sp_RbVal _v%d = _t%d->vals[_t%d->order[_t%d]];", ti, th, th, ti);
           buf_printf(b, " if (!sp_poly_nil_p(_v%d)) sp_PolyPolyHash_set(_t%d, _t%d->keys[_t%d->order[_t%d]], _v%d); }", ti, tr, th, th, ti, ti);
@@ -5943,6 +5957,7 @@ else {
           int th = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
           buf_printf(b, "({ sp_%sHash *_t%d = ", hn, th); emit_expr(c, recv, b);
           buf_printf(b, "; sp_%sHash *_t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);", hn, tr, hn, tr);
+          buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, th, tr, th, tr, th);
           buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {", ti, ti, th, ti);
           buf_printf(b, " sp_RbVal _v%d = sp_%sHash_get(_t%d, _t%d->order[_t%d]);", ti, hn, th, th, ti);
           buf_printf(b, " if (!sp_poly_nil_p(_v%d)) sp_%sHash_set(_t%d, _t%d->order[_t%d], _v%d); }", ti, hn, tr, th, ti, ti);
@@ -11788,8 +11803,9 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
   /* Hash#merge(other) { |key, old, new| }: the block decides the value for a
      key both hashes carry. Walk the other hash's pairs into a copy of the
      receiver, consulting the block on a collision -- sp_poly_hash_merge has no
-     block form, and the typed Hash path cannot serve a boxed receiver. */
-  if (recv >= 0 && (rt == TY_POLY || ty_is_hash(rt)) && sp_streq(name, "merge") && argc == 1 &&
+     block form, and this arm handles boxed/cross-layout receivers. */
+  if (recv >= 0 && (rt == TY_POLY || (ty_is_hash(rt) && rt != TY_POLY_POLY_HASH)) &&
+      sp_streq(name, "merge") && argc == 1 &&
       nt_ref(nt, id, "block") >= 0 && !user_defines_or_reads(c, "merge")) {
     int mblk = nt_ref(nt, id, "block");
     int mbody = nt_ref(nt, mblk, "body");
