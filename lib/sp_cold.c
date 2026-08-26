@@ -2749,15 +2749,6 @@ sp_int sp_float_to_i_checked(sp_float f) {
 
 /* ---- Box helpers (0 optcarrot uses) -- relocated from spinel_rt.h. ---- */
 
-/* Boxing a nullable-int value (int?): SP_INT_NIL is the reserved nil sentinel
-   and never a legitimate integer, so a sentinel must surface as Ruby nil rather
-   than a boxed INT_MIN. Used when an int? value (hash miss, rindex, nonzero?,
-   ...) flows into a poly slot. */
-sp_RbVal sp_box_int_or_nil(sp_int v) { return v == SP_INT_NIL ? sp_box_nil() : sp_box_int(v); }
-/* The float counterpart. A float slot spells nil with its own reserved
-   sentinel, and boxing that as an ordinary Float made it a Hash key that no
-   literal nil could match (#3493). */
-sp_RbVal sp_box_float_or_nil(sp_float v) { return sp_float_is_nil(v) ? sp_box_nil() : sp_box_float(v); }
 /* An element read back out of a TYPED array boxes at the runtime read, which
    has no room for the sentinel check the hot path cannot afford. Where analyze
    knows a particular receiver's elements can hold one, it wraps that read in

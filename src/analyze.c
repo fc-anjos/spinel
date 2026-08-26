@@ -10387,6 +10387,31 @@ int nullable_int_elem_read(Compiler *c, int call) {
          nullable_int_elem_expr(c, recv, 0);
 }
 
+/* A call that answers one element of its receiver, or nil when there is none
+   (`a[i]`, `h[k]`, `[].max`, `a.find { }`), plus `Integer(s, exception: false)`. */
+static int elem_miss_call(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  const char *nm = nt_str(nt, v, "name");
+  if (!nm) return 0;
+  int recv = nt_ref(nt, v, "receiver");
+  int args = nt_ref(nt, v, "arguments");
+  int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  int blk = nt_ref(nt, v, "block");
+  if (recv < 0) {
+    if ((sp_streq(nm, "Integer") || sp_streq(nm, "Float")) && argc >= 2 && argv &&
+        nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) return 1;
+    return 0;
+  }
+  if (sp_streq(nm, "[]") || sp_streq(nm, "at")) return argc == 1 && blk < 0;
+  if (sp_streq(nm, "dig")) return argc >= 1;
+  if (sp_streq(nm, "first") || sp_streq(nm, "last") || sp_streq(nm, "sample"))
+    return argc == 0 && blk < 0;
+  if (sp_streq(nm, "min") || sp_streq(nm, "max")) return argc == 0;
+  if (sp_streq(nm, "min_by") || sp_streq(nm, "max_by")) return argc == 0 && blk >= 0;
+  if (sp_streq(nm, "find") || sp_streq(nm, "detect")) return blk >= 0;
+  return 0;
+}
+
 /* Can this expression leave the sentinel in an int slot? */
 int nullable_int_value(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
@@ -10465,6 +10490,9 @@ int nullable_int_value(Compiler *c, int v) {
   }
   if (nt_kind(nt, v) == NK_CallNode) {
     if (nullable_int_call_name(nt_str(nt, v, "name"))) return 1;
+    /* a missed element read is the sentinel in an int slot; only boxing is
+       affected, typed reads keep their inline arms */
+    if (elem_miss_call(c, v)) return 1;
     /* a method whose --rbs signature pins `Integer?`, or whose own return
        expression can be the sentinel: either way its nil is the sentinel and a
        caller that boxes the value has to answer nil. Resolved the way emission

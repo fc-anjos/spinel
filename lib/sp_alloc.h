@@ -790,9 +790,11 @@ static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_sprintf("#
 static inline sp_bool sp_encoding_eq(sp_Encoding a,sp_Encoding b){const char*an=sp_encoding_name(a);const char*bn=sp_encoding_name(b);return strcmp(an,bn)==0;}
 
 /* ---- Box helper prototypes (0 optcarrot uses; bodies in lib/sp_cold.c). ---- */
-sp_RbVal sp_box_int_or_nil(sp_int v);
+/* An int? / float? value crossing into a poly slot: the sentinel is nil, never
+   a number. Inline because every boxed element read goes through here. */
+static inline sp_RbVal sp_box_int_or_nil(sp_int v) { return v == SP_INT_NIL ? sp_box_nil() : sp_box_int(v); }
+static inline sp_RbVal sp_box_float_or_nil(sp_float v) { return sp_float_is_nil(v) ? sp_box_nil() : sp_box_float(v); }
 sp_RbVal sp_unsentinel(sp_RbVal v);
-sp_RbVal sp_box_float_or_nil(sp_float v);
 sp_RbVal sp_box_bigint(sp_Bigint *b);
 sp_RbVal sp_box_encoding(sp_Encoding e);
 sp_RbVal sp_box_nullable_str(const char *v);
