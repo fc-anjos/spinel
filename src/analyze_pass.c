@@ -3673,28 +3673,40 @@ int infer_param_types(Compiler *c) {
         }
         continue;
       }
-      int mi = comp_method_index(c, name);
+      int mi = -1;
       int caller_cid = -1;
       /* bare call inside an instance_eval/exec block: dispatch on the
          receiver's class so its params get the call-site arg types. */
       int iec = ie_class_of(c, id);
-      if (mi < 0 && iec >= 0) {
+      if (iec >= 0) {
         int def_cid = -1;
         mi = comp_method_in_chain(c, iec, name, &def_cid);
         if (mi >= 0) caller_cid = def_cid >= 0 ? def_cid : iec;
       }
+      /* Otherwise the call is on the enclosing definition's self: a class
+         method resolves against the singleton chain, an instance method
+         against the instance chain. Both come before a top-level def, which
+         is a private method on Object and so sits at the bottom of every
+         ancestry. Asking for the free functions first bound this call's
+         argument types to a same-named top-level method and left the real
+         callee's parameters to be typed by its own body instead (#4106). */
       if (mi < 0) {
         Scope *self = comp_scope_of(c, id);
         if (self->class_id >= 0) {
           caller_cid = self->class_id;
           int def_cid = -1;
-          mi = comp_method_in_chain(c, self->class_id, name, &def_cid);
-          if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
-          /* inside a class method: also check sibling class methods */
-          if (mi < 0 && self->is_cmethod)
-            mi = comp_cmethod_in_chain(c, self->class_id, name, NULL);
+          if (self->is_cmethod) {
+            mi = comp_cmethod_in_chain(c, self->class_id, name, &def_cid);
+            if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
+          }
+          if (mi < 0) {
+            def_cid = -1;
+            mi = comp_method_in_chain(c, self->class_id, name, &def_cid);
+            if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
+          }
         }
       }
+      if (mi < 0) mi = comp_method_index(c, name);
       if (mi < 0) mi = comp_included_method_index(c, name);
       changed |= bind_call_params(c, id, mi);
       /* Propagate to descendant classes that directly override the same method.

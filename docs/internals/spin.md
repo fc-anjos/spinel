@@ -16,7 +16,8 @@ scoped to the language, like `mruby-*`.
 
 Status: implemented through M3 — scaffold, path/git/index dependencies with
 MVS selection, `spin.lock`, vendor + offline, snapshot tests, carried native
-C, declared native build steps (R10), `list`/`tree`/`search`. The hermetic
+C, declared native build steps (R10), the flags handoff and `[package]
+exclude` (R11), `list`/`tree`/`search`. The hermetic
 end-to-end check (`tools/spin_e2e.sh`) runs inside `make check`. Sections below note the
 pieces that are still specification.
 
@@ -245,7 +246,7 @@ specification:* `spin lock --update` and `--frozen` (CI mode).
 ### R6 — C in packages (implemented)
 
 - Carried C is discovered by extension: every `.c` in the package tree (outside
-  `build/`, `vendor/`, `test/`) compiles into the shared cache
+  `build/`, `vendor/`, `test/`, and any path in `[package] exclude`) compiles into the shared cache
   `$XDG_CACHE_HOME/spin/native/<package>-<version>-<cc>/` — never into the
   package tree — and the objects reach the compiler via its repeatable
   `--link` flag; `spinel` itself never compiles package C. Objects rebuild when
@@ -255,6 +256,19 @@ specification:* `spin lock --update` and `--frozen` (CI mode).
   Ruby-side `ffi_lib`/`ffi_func` DSL (its SPINEL_LINK/SPINEL_CFLAGS markers
   already reach the link line). In-TU splicing of carried C is a possible
   future optimization behind the same declaration, not a third shape.
+- **`[package] exclude`** (implemented; #4105) prunes globs, relative to the
+  package root, from carried-C discovery and from the staleness scan that
+  decides whether the cached objects are current. The asymmetry it answers:
+  **`.rb` enters the build by reachability (`require`), `.c` enters by
+  presence.** For a library that is R2 working as intended — role by
+  extension, nothing listed in the manifest. For an application whose
+  repository also holds a C program of its own, presence is wrong: its
+  `main()` collides with the generated one and the link fails, with no way to
+  say so. `.rb` needs no counterpart, since nothing compiles it unless
+  something requires it; an excluded `.h` stays on the include path, being
+  excluded from compilation rather than from inclusion. Globs are expanded at
+  manifest-read time into the same exact-path list `[[build]]` workdirs
+  already travel in, so naming a directory prunes its subtree.
 - *Still specification:* the `spinel/runtime.h` umbrella defining the
   stable public sp_ surface for carried C; today package C sees the same
   headers as the generated TU, with no compatibility promise on internals.
@@ -397,6 +411,39 @@ libs = ["${build.out}/libggml.a"]   # artifacts reach the R6 --link surface
   recommended packaging convention is cargo's `-sys` shape: a leaf package
   carrying the vendored tree, the `[[build]]` entries, and the raw
   `ffi_*` declarations.
+
+### R11 — the flags handoff (implemented; #4105)
+
+`spin flags` prints the compiler flags this project implies — the `-I` roots
+for every resolved dependency and the project itself, `--rbs` when it carries
+sidecars, `--link` per cached native object, and `--require-gate` — with no
+entry file and no `-o`. It is one producer with `spin build`, so what a caller
+compiles with is what spin would have compiled with rather than an
+approximation of it. Reading the native objects compiles any that are cold,
+which is what makes the printed `--link` paths real; that progress goes to
+stderr, since stdout is the flag string.
+
+**Why it exists.** R2 keeps *an application is a package with executables* —
+one manifest, no second project kind — and that is worth keeping: it is what
+lets role be carried by extension instead of by manifest lists. But it means
+`spin build` owns the directory it sits in, and some applications live in a
+repository whose layout is not spin's to arrange: Ruby and C side by side, one
+Makefile driving both, nothing willing to move. Rather than a second project
+kind, or a manifest that lists sources after all, spin gets a door: it stays
+the supplier of resolved dependencies and compiled native objects, and hands
+the build back.
+
+`[package] exclude` (R6) answers the other half, for a tree that does want
+`spin build` to own it but holds C that must not be compiled in.
+
+Every printed path is absolute: `find_root` walks up from the working
+directory, path dependencies resolve through `File.expand_path`, and cache
+objects are named from the cache root. The caller's working directory is its
+own tree, not the project's.
+
+`--require-gate` is the compiler flag spelling of `SPINEL_REQUIRE_GATE`, added
+with this: an env assignment cannot ride inside a flag string, and the gate is
+part of what `spin build` compiles under.
 
 ## 5. Project model
 

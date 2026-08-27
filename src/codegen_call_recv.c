@@ -1729,8 +1729,7 @@ int emit_array_call(Compiler *c, int id, Buf *b) {
     if (rt == TY_POLY_ARRAY && sp_streq(name, "sum") && argc == 1 && nt_ref(nt, id, "block") < 0) {
       TyKind init_t = comp_ntype(c, argv[0]);
       /* an Array initial value concatenates one level ([[1],[2]].sum([])) */
-      if (ty_is_array(init_t) ||
-          (init_t == TY_UNKNOWN && nt_type(nt, argv[0]) && sp_streq(nt_type(nt, argv[0]), "ArrayNode"))) {
+      if (ty_is_array(init_t)) {
         buf_puts(b, "sp_PolyArray_sum_concat("); emit_expr(c, recv, b); buf_puts(b, ", ");
         emit_boxed(c, argv[0], b); buf_puts(b, ")");
         return 1;
@@ -2478,12 +2477,11 @@ else {
         }
         return 1;
       }
-      if (sp_streq(name, "+") && argc == 1 && (a0 == rt || a0 == TY_UNKNOWN)) {
-        /* array + array of the same kind -> a fresh concatenation. An empty
-           literal `[]` arg (TY_UNKNOWN) concatenates a null (copies recv). */
+      if (sp_streq(name, "+") && argc == 1 && a0 == rt) {
+        /* array + array of the same kind -> a fresh concatenation */
         buf_printf(b, "sp_%sArray_concat(", k);
         emit_expr(c, recv, b); buf_puts(b, ", ");
-        if (a0 == TY_UNKNOWN) buf_puts(b, "NULL"); else emit_expr(c, argv[0], b);
+        emit_expr(c, argv[0], b);
         buf_puts(b, ")");
         return 1;
       }
@@ -2669,13 +2667,6 @@ else {
         int tb[16]; TyKind at[16]; int nargs = argc < 16 ? argc : 16;
         for (int j = 0; j < nargs; j++) {
           tb[j] = ++g_tmp; at[j] = comp_ntype(c, argv[j]);
-          /* an empty [] argument slots into a PolyArray (kj below); pin its
-             cached type so emit_expr emits sp_PolyArray_new() rather than the
-             sp_IntArray_new() default (#3223) */
-          if (at[j] == TY_UNKNOWN && nt_type(nt, argv[j]) && sp_streq(nt_type(nt, argv[j]), "ArrayNode")) {
-            int aen = 0; nt_arr(nt, argv[j], "elements", &aen);
-            if (aen == 0) { c->ntype[argv[j]] = TY_POLY_ARRAY; at[j] = TY_POLY_ARRAY; }
-          }
         }
         const char *ka = (rt == TY_POLY_ARRAY) ? "Poly" : k;
         buf_printf(b, "({ sp_%sArray *_t%d = ", ka, ta); emit_expr(c, recv, b); buf_puts(b, ";");
@@ -2819,13 +2810,6 @@ else {
       }
       if (sp_streq(name, "product") && argc == 1) {
         TyKind at = comp_ntype(c, argv[0]);
-        /* an empty [] argument defaults to a PolyArray slot (kb below); pin its
-           cached type so emit_expr emits sp_PolyArray_new() rather than the
-           sp_IntArray_new() default, keeping the C well-typed (#3223) */
-        if (at == TY_UNKNOWN && nt_type(nt, argv[0]) && sp_streq(nt_type(nt, argv[0]), "ArrayNode")) {
-          int aen = 0; nt_arr(nt, argv[0], "elements", &aen);
-          if (aen == 0) { c->ntype[argv[0]] = TY_POLY_ARRAY; at = TY_POLY_ARRAY; }
-        }
         const char *kb = (at == TY_POLY_ARRAY) ? "Poly" : (array_kind(at) ? array_kind(at) : "Poly");
         int ta = ++g_tmp, tb = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp, tj = ++g_tmp, tpair = ++g_tmp;
         Buf ra; memset(&ra, 0, sizeof ra); Buf rb2; memset(&rb2, 0, sizeof rb2);
@@ -3464,7 +3448,18 @@ else {
                    k, o, k, k, o, k, t, k, o, k, t, o);
         return 1;
       }
+      /* a typed array never holds an element of another kind: include? is
+         false and index is nil, with both operands still evaluated */
+      int elem_mismatch = 0;
+      if (argc == 1 && rt == TY_STR_ARRAY && a0 != TY_STRING && a0 != TY_UNKNOWN && a0 != TY_POLY) elem_mismatch = 1;
+      if (argc == 1 && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY) &&
+          a0 != TY_INT && a0 != TY_FLOAT && a0 != TY_UNKNOWN && a0 != TY_POLY) elem_mismatch = 1;
       if ((sp_streq(name, "index") || sp_streq(name, "find_index") || sp_streq(name, "rindex")) && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY)) {
+        if (elem_mismatch) {
+          buf_puts(b, "((void)("); emit_expr(c, recv, b);
+          buf_puts(b, "), (void)("); emit_expr(c, argv[0], b); buf_puts(b, "), sp_box_nil())");
+          return 1;
+        }
         /* nil-on-miss -> poly */
         const char *fn = sp_streq(name, "rindex") ? "rindex_poly" : "index_poly";
         buf_printf(b, "sp_%sArray_%s(", k, fn);
@@ -3473,15 +3468,8 @@ else {
         buf_puts(b, ")");
         return 1;
       }
-      if (sp_streq(name, "include?") && argc == 1) {
-        /* a typed array can never contain an element of an incompatible
-           type (numeric vs string), so the answer is statically false;
-           still evaluate both operands for any side effects. */
-        int mismatch = 0;
-        if (rt == TY_STR_ARRAY && a0 != TY_STRING && a0 != TY_UNKNOWN && a0 != TY_POLY) mismatch = 1;
-        if ((rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY) &&
-            a0 != TY_INT && a0 != TY_FLOAT && a0 != TY_UNKNOWN && a0 != TY_POLY) mismatch = 1;
-        if (mismatch) {
+      if ((sp_streq(name, "include?") || sp_streq(name, "member?")) && argc == 1) {
+        if (elem_mismatch) {
           buf_puts(b, "((void)("); emit_expr(c, recv, b);
           buf_puts(b, "), (void)("); emit_expr(c, argv[0], b); buf_puts(b, "), 0)");
           return 1;
@@ -3988,7 +3976,13 @@ else {
         buf_puts(b, "sp_PolyArray_get("); emit_expr(c, recv, b); buf_puts(b, ", 0)");
         return 1;
       }
-      if ((sp_streq(name, "to_a") || sp_streq(name, "entries")) && argc == 0) { emit_expr(c, recv, b); return 1; }
+      if ((sp_streq(name, "to_a") || sp_streq(name, "entries") || sp_streq(name, "to_ary") ||
+           sp_streq(name, "deconstruct")) && argc == 0) { emit_expr(c, recv, b); return 1; }
+      if ((sp_streq(name, "union") || sp_streq(name, "difference") || sp_streq(name, "intersection")) &&
+          argc == 0) {
+        buf_puts(b, "sp_PolyArray_dup("); emit_expr(c, recv, b); buf_puts(b, ")");
+        return 1;
+      }
       if (sp_streq(name, "fetch") && (argc == 1 || argc == 2)) {
         int blk = nt_ref(nt, id, "block");
         int ta = ++g_tmp, ti = ++g_tmp, tn = ++g_tmp, tnorm = ++g_tmp;
@@ -4026,13 +4020,6 @@ else {
         int tb[16]; TyKind at[16]; int nargs = argc < 16 ? argc : 16;
         for (int j = 0; j < nargs; j++) {
           tb[j] = ++g_tmp; at[j] = comp_ntype(c, argv[j]);
-          /* an empty [] argument slots into a PolyArray (kj below); pin its
-             cached type so emit_expr emits sp_PolyArray_new() rather than the
-             sp_IntArray_new() default (#3223) */
-          if (at[j] == TY_UNKNOWN && nt_type(nt, argv[j]) && sp_streq(nt_type(nt, argv[j]), "ArrayNode")) {
-            int aen = 0; nt_arr(nt, argv[j], "elements", &aen);
-            if (aen == 0) { c->ntype[argv[j]] = TY_POLY_ARRAY; at[j] = TY_POLY_ARRAY; }
-          }
         }
         Buf ra = expr_buf(c, recv);
         buf_printf(b, "({ sp_PolyArray *_t%d = %s;", ta, ra.p ? ra.p : "NULL"); free(ra.p);
@@ -5442,6 +5429,7 @@ else {
             tn = ++g_tmp, ti = ++g_tmp, tk = ++g_tmp, tv = ++g_tmp;
         buf_printf(b, "({ sp_PolyPolyHash *_t%d = sp_PolyPolyHash_new(); SP_GC_ROOT(_t%d);", tr, tr);
         buf_printf(b, " sp_PolyPolyHash *_t%d = ", tc); emit_expr(c, recv, b); buf_puts(b, ";");
+        buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, tc, tr, tc, tr, tc);
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {"
                       " sp_int _ix = _t%d->order[_t%d];"
                       " sp_PolyPolyHash_set(_t%d, _t%d->keys[_ix], _t%d->vals[_ix]); }",
@@ -5500,6 +5488,9 @@ else {
         buf_printf(b, "({ %s _t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);", c_type_name(rt), tr, hn, tr);
         /* copy the receiver into the fresh result */
         buf_printf(b, " %s _t%d = ", c_type_name(rt), tc); emit_expr(c, recv, b); buf_puts(b, ";");
+        buf_printf(b, " _t%d->default_v = _t%d->default_v;", tr, tc);
+        if (vt == TY_POLY)
+          buf_printf(b, " _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, tc, tr, tc);
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++)"
                       " sp_%sHash_set(_t%d, _t%d->order[_t%d], sp_%sHash_get(_t%d, _t%d->order[_t%d]));",
                    tj, tj, tc, tj, hn, tr, tc, tj, hn, tc, tc, tj);
@@ -5662,6 +5653,14 @@ else {
         buf_printf(b, "({ sp_%sHash *_t%d = sp_%sHash_dup(", hn, t, hn);
         emit_expr(c, recv, b);
         buf_printf(b, "); SP_GC_ROOT(_t%d);", t);
+        /* except answers a fresh hash: no default, no default proc */
+        {
+          TyKind evt = ty_hash_val(rt);
+          if (evt == TY_POLY)
+            buf_printf(b, " _t%d->default_v = sp_box_nil(); _t%d->dproc = NULL; _t%d->dproc_self = NULL;", t, t, t);
+          else if (evt == TY_STRING) buf_printf(b, " _t%d->default_v = NULL;", t);
+          else buf_printf(b, " _t%d->default_v = SP_INT_NIL;", t);
+        }
         for (int i = 0; i < argc; i++) {
           /* a splatted key list deletes each of its members (#3561) */
           if (nt_type(nt, argv[i]) && sp_streq(nt_type(nt, argv[i]), "SplatNode")) {
@@ -5933,6 +5932,8 @@ else {
           int th = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
           buf_printf(b, "({ sp_PolyPolyHash *_t%d = ", th); emit_expr(c, recv, b);
           buf_printf(b, "; sp_PolyPolyHash *_t%d = sp_PolyPolyHash_new(); SP_GC_ROOT(_t%d);", tr, tr);
+          /* compact keeps the default and default proc, like dup */
+          buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, th, tr, th, tr, th);
           buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {", ti, ti, th, ti);
           buf_printf(b, " sp_RbVal _v%d = _t%d->vals[_t%d->order[_t%d]];", ti, th, th, ti);
           buf_printf(b, " if (!sp_poly_nil_p(_v%d)) sp_PolyPolyHash_set(_t%d, _t%d->keys[_t%d->order[_t%d]], _v%d); }", ti, tr, th, th, ti, ti);
@@ -5943,6 +5944,7 @@ else {
           int th = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
           buf_printf(b, "({ sp_%sHash *_t%d = ", hn, th); emit_expr(c, recv, b);
           buf_printf(b, "; sp_%sHash *_t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);", hn, tr, hn, tr);
+          buf_printf(b, " _t%d->default_v = _t%d->default_v; _t%d->dproc = _t%d->dproc; _t%d->dproc_self = _t%d->dproc_self;", tr, th, tr, th, tr, th);
           buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {", ti, ti, th, ti);
           buf_printf(b, " sp_RbVal _v%d = sp_%sHash_get(_t%d, _t%d->order[_t%d]);", ti, hn, th, th, ti);
           buf_printf(b, " if (!sp_poly_nil_p(_v%d)) sp_%sHash_set(_t%d, _t%d->order[_t%d], _v%d); }", ti, hn, tr, th, ti, ti);
@@ -9422,34 +9424,17 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
       if (argc == 1) { buf_printf(b, "sp_time_iso8601_frac(%s, ", r); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
       else buf_printf(b, "sp_time_iso8601(%s)", r);
     }
-    else if ((sp_streq(name, "floor") || sp_streq(name, "ceil") || sp_streq(name, "round")) && argc == 0) {
-      /* whole-second rounding of the subsecond part */
-      int tt = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; ", tt, r);
-      if (sp_streq(name, "floor")) buf_printf(b, "_t%d.tv_nsec = 0;", tt);
-      else if (sp_streq(name, "ceil")) buf_printf(b, "if (_t%d.tv_nsec > 0) { _t%d.tv_sec += 1; _t%d.tv_nsec = 0; }", tt, tt, tt);
-      else buf_printf(b, "if (_t%d.tv_nsec >= 500000000) _t%d.tv_sec += 1; _t%d.tv_nsec = 0;", tt, tt, tt);
-      buf_printf(b, " _t%d; })", tt);
-    }
-    else if ((sp_streq(name, "floor") || sp_streq(name, "ceil") || sp_streq(name, "round")) && argc == 1) {
-      /* round the subsecond part to `ndigits` decimal places (#3089).
-         scale = 10^(9-ndigits); ndigits >= 9 keeps full nanosecond
-         resolution. A carry past 1e9 bumps the second. */
-      int tt = ++g_tmp, td = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_int _t%d = ", tt, r, td);
-      emit_int_expr(c, argv[0], b);
-      /* a negative digit count is CRuby's ArgumentError, not a clamp to zero
-         (#3700) */
-      buf_printf(b, "; if (_t%d < 0) sp_raise_cls(\"ArgumentError\","
-                    " sp_sprintf(\"negative ndigits given: %%lld\", (long long)_t%d));", td, td);
-      buf_printf(b, " if (_t%d < 9) { if (_t%d < 0) _t%d = 0;"
-                    " int64_t _sc = 1; for (sp_int _k = _t%d; _k < 9; _k++) _sc *= 10;"
-                    " int64_t _ns = _t%d.tv_nsec; ", td, td, td, td, tt);
-      if (sp_streq(name, "floor"))     buf_puts(b, "_ns = _ns / _sc * _sc;");
-      else if (sp_streq(name, "ceil")) buf_puts(b, "if (_ns % _sc) _ns = (_ns / _sc + 1) * _sc;");
-      else                             buf_puts(b, "_ns = (_ns + _sc / 2) / _sc * _sc;");
-      buf_printf(b, " if (_ns >= 1000000000) { _t%d.tv_sec += 1; _ns -= 1000000000; }"
-                    " _t%d.tv_nsec = (int32_t)_ns; } _t%d; })", tt, tt, tt);
+    else if ((sp_streq(name, "floor") || sp_streq(name, "ceil") || sp_streq(name, "round")) &&
+             argc <= 1) {
+      /* The subsecond part to `ndigits` decimal places (#3089); no argument is
+         ndigits 0, whole seconds. A negative count is CRuby's ArgumentError
+         rather than a clamp to zero (#3700). The arithmetic lives in the
+         runtime so the boxed receiver answers exactly the same (#4109). */
+      int mode = sp_streq(name, "floor") ? 0 : sp_streq(name, "ceil") ? 1 : 2;
+      buf_printf(b, "sp_time_round_to(%s, ", r);
+      if (argc == 1) emit_int_expr(c, argv[0], b);
+      else buf_puts(b, "0");
+      buf_printf(b, ", %d)", mode);
     }
     else if (sp_streq(name, "sunday?"))    buf_printf(b, "(sp_time_wday(%s) == 0)", r);
     else if (sp_streq(name, "monday?"))    buf_printf(b, "(sp_time_wday(%s) == 1)", r);
@@ -11788,8 +11773,9 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
   /* Hash#merge(other) { |key, old, new| }: the block decides the value for a
      key both hashes carry. Walk the other hash's pairs into a copy of the
      receiver, consulting the block on a collision -- sp_poly_hash_merge has no
-     block form, and the typed Hash path cannot serve a boxed receiver. */
-  if (recv >= 0 && (rt == TY_POLY || ty_is_hash(rt)) && sp_streq(name, "merge") && argc == 1 &&
+     block form, and this arm handles boxed/cross-layout receivers. */
+  if (recv >= 0 && (rt == TY_POLY || (ty_is_hash(rt) && rt != TY_POLY_POLY_HASH)) &&
+      sp_streq(name, "merge") && argc == 1 &&
       nt_ref(nt, id, "block") >= 0 && !user_defines_or_reads(c, "merge")) {
     int mblk = nt_ref(nt, id, "block");
     int mbody = nt_ref(nt, mblk, "body");
@@ -11872,6 +11858,22 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
      an arm for these placed inside it can never be entered. Each reuses the
      runtime function the concrete arm calls, and declines to a user class
      owning the name, as the neighbours do. */
+  /* The separator forms of the trimming methods. Their argc==0 spellings are
+     in the table above; a line reader chomping with its OWN separator --
+     `line.chomp(eol)` -- passes one, and that reached NoMethodError. */
+  if (recv >= 0 && rt == TY_POLY && argc == 1 && !user_defines_or_reads(c, name) &&
+      (sp_streq(name, "chomp") || sp_streq(name, "delete_prefix") ||
+       sp_streq(name, "delete_suffix"))) {
+    const char *fn = sp_streq(name, "chomp") ? "sp_str_chomp_sep"
+                   : sp_streq(name, "delete_prefix") ? "sp_str_delete_prefix"
+                   : "sp_str_delete_suffix";
+    /* TY_STRING, not boxed: the analyze arm types these as the String they
+       are, so the slot takes a const char * directly. */
+    buf_printf(b, "%s(sp_poly_recv_s(", fn);
+    emit_expr(c, recv, b); buf_printf(b, ", \"%s\"), ", name);
+    emit_str_expr(c, argv[0], b); buf_puts(b, ")");
+    return 1;
+  }
   if (recv >= 0 && rt == TY_POLY && !user_defines_or_reads(c, name) &&
       ((sp_streq(name, "unpack") && argc == 1) ||
        (sp_streq(name, "byteslice") && (argc == 1 || argc == 2)) ||

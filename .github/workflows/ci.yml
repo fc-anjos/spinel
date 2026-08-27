@@ -55,6 +55,14 @@ jobs:
         with:
           ruby-version: "3.4"
 
+      # coreutils is NOT preinstalled on the macOS runners, so `timeout` and
+      # `gtimeout` were both absent and the whole suite ran with no time limit:
+      # one hanging test held the job until GitHub's six-hour cap instead of
+      # failing in ten seconds. Installing it is what makes the per-test
+      # timeout real; the PATH line then gives the GNU names.
+      - name: Install GNU coreutils (macOS)
+        if: runner.os == 'macOS'
+        run: brew install coreutils
       - name: Expose GNU coreutils on PATH (macOS)
         if: runner.os == 'macOS'
         run: echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"

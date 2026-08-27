@@ -738,6 +738,14 @@ read_class_atom(re_compiler *c, re_charclass *cc)
       }
       return cp;
     }
+    /* Unlike `\K`/`\R`/`\X`, CRuby reads a property escape inside a class as
+       a property test there too, not as its literal letters -- `[\p{Alpha}]`
+       matches letters, it doesn't hold the text "p{Alpha}". The engine
+       carries no property table, so this is refused the same way the
+       top-level dispatcher already refuses the bare form. */
+    if ((peek(c) == 'p' || peek(c) == 'P') && c->p + 1 < c->src_end && c->p[1] == '{') {
+      compile_error(c, "character property is not supported");
+    }
     return (uint32_t)parse_escape(c);
   }
   uint8_t b = (uint8_t)*c->p;

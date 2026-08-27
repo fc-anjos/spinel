@@ -56,6 +56,9 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
 sp_int sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc);
 sp_int sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc);
 sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc);
+/* Addrinfo-form connect_nonblock (already-resolved endpoint) */
+sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen,
+                                 sp_bool exc);
 sp_bool sp_io_is_a(sp_File *f, const char *cls);
 sp_bool sp_io_instance_of(sp_File *f, const char *cls);
 sp_File *sp_sock_udp_new(sp_int family);
@@ -138,5 +141,13 @@ typedef struct { DIR *dp; const char *path; } sp_Dir;
 /* ---- sp_io_pipe/sysopen relocated from spinel_rt.h (0 optcarrot uses). ---- */
 sp_PolyArray *sp_io_pipe(void);
 sp_int sp_io_sysopen(const char *path);
+
+/* IO.select accepts anything that answers #to_io, which is how CRuby lets a
+   wrapper -- a protocol object holding a socket -- be waited on. The runtime
+   cannot dispatch a user method itself, so codegen emits the cls_id switch and
+   main() installs it here, the same shape as sp_user_exc_parent_fn and the
+   sp_json_*_fn hooks. NULL when the program defines no #to_io, which is when
+   an element that is not an IO is the TypeError it always was. */
+extern sp_File *(*sp_user_to_io_hook)(sp_RbVal);
 
 #endif

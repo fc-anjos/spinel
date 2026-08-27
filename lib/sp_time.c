@@ -17,6 +17,25 @@
 #include "sp_time.h"
 #include "sp_alloc.h"   /* sp_str_dup_external / sp_str_empty for the GC formatters */
 
+/* Time#floor / #ceil / #round, shared by the typed and the boxed receiver so
+   the two cannot drift. The no-argument form is ndigits 0: scale is 10^9 and
+   every mode lands the value on a whole second. */
+sp_Time sp_time_round_to(sp_Time t, int64_t ndigits, int mode) {
+  /* CRuby names no number here, and a supported method's message is part of
+     what it means to be a subset of it. */
+  if (ndigits < 0) sp_raise_cls("ArgumentError", "negative ndigits given");
+  if (ndigits >= 9) return t;                 /* full nanosecond resolution */
+  int64_t scale = 1;
+  for (int64_t k = ndigits; k < 9; k++) scale *= 10;
+  int64_t ns = t.tv_nsec;
+  if (mode == 0)      ns = ns / scale * scale;
+  else if (mode == 1) { if (ns % scale) ns = (ns / scale + 1) * scale; }
+  else                ns = (ns + scale / 2) / scale * scale;
+  if (ns >= 1000000000) { t.tv_sec += 1; ns -= 1000000000; }
+  t.tv_nsec = (int32_t)ns;
+  return t;
+}
+
 sp_Time sp_time_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);

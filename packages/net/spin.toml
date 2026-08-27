@@ -1,0 +1,6 @@
+[package]
+name = "net"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# `require "net/http"` -- an HTTP/HTTPS client in pure Ruby over TCPSocket and
+# the openssl package. See net/http.rb for what is deliberately absent.

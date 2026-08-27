@@ -3263,7 +3263,53 @@ void process_include_body(Compiler *c, int ci, int body_node) {
       if (aty && sp_streq(aty, "ConstantReadNode")) mname = nt_str(nt, args[j], "name");
       else if (aty && sp_streq(aty, "ConstantPathNode")) mname = nt_str(nt, args[j], "name");
       int mod_id = mname ? comp_class_index(c, mname) : -1;
-      if (mod_id < 0) continue;
+      if (mod_id < 0) {
+        /* A module with no class of its own -- a builtin named through its
+           path, `include IO::WaitReadable`. The AST name is the leaf, so the
+           qualified string is rebuilt from the parent chain; that string is
+           what `rescue IO::WaitReadable` compares against, since the module
+           match is by name. Silently dropping these left the include with no
+           effect at all (#1054, read_nonblock). */
+        if (aty && sp_streq(aty, "ConstantPathNode") && mname) {
+          char segs[8][64]; int nseg = 0;
+          int qpar = nt_ref(nt, args[j], "parent");
+          while (qpar >= 0 && nseg < 8) {
+            const char *pty = nt_type(nt, qpar);
+            const char *pn = nt_str(nt, qpar, "name");
+            if (pty && sp_streq(pty, "ConstantReadNode") && pn) {
+              snprintf(segs[nseg++], sizeof segs[0], "%s", pn);
+              break;
+            }
+            if (pty && sp_streq(pty, "ConstantPathNode")) {
+              if (pn) snprintf(segs[nseg++], sizeof segs[0], "%s", pn);
+              qpar = nt_ref(nt, qpar, "parent");
+              continue;
+            }
+            break;
+          }
+          char qual[256]; qual[0] = 0;
+          for (int q = nseg - 1; q >= 0; q--) {
+            strncat(qual, segs[q], sizeof qual - strlen(qual) - 1);
+            strncat(qual, "::", sizeof qual - strlen(qual) - 1);
+          }
+          strncat(qual, mname, sizeof qual - strlen(qual) - 1);
+          ClassInfo *cif2 = &c->classes[ci];
+          int dup = 0;
+          for (int m = 0; m < cif2->nincluded_mod_names; m++)
+            if (sp_streq(cif2->included_mod_names[m], qual)) { dup = 1; break; }
+          if (!dup) {
+            if (cif2->nincluded_mod_names >= cif2->cincluded_mod_names) {
+              cif2->cincluded_mod_names = cif2->cincluded_mod_names ? cif2->cincluded_mod_names * 2 : 4;
+              char **nn = realloc(cif2->included_mod_names,
+                                  sizeof(char *) * (size_t)cif2->cincluded_mod_names);
+              if (!nn) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+              cif2->included_mod_names = nn;
+            }
+            cif2->included_mod_names[cif2->nincluded_mod_names++] = strdup(qual);
+          }
+        }
+        continue;
+      }
       /* record membership for `rescue M` matching (dedup across reopenings) */
       {
         ClassInfo *cif = &c->classes[ci];

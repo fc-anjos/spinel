@@ -1,0 +1,26 @@
+["200", "OK", "ok:"]
+"text/plain"
+"text/plain"
+true
+true
+["200", "hello world"]
+["200", "ok:a=1&b=x+y"]
+["404", "Not Found", "bye"]
+[true, true, false]
+"ok:"
+"ok:"
+"/hook?k=v"
+"application/json"
+["200", "ok:{}"]
+"application/json"
+"application/json"
+"one, two"
+"200"
+GET /a?x=1 HTTP/1.1|host-has-port=true|content-type-lines=0||body=
+GET /chunked HTTP/1.1|host-has-port=true|content-type-lines=0||body=
+POST /f HTTP/1.1|host-has-port=true|content-type-lines=1||body=a=1&b=x+y
+GET /notfound HTTP/1.1|host-has-port=true|content-type-lines=0||body=
+GET /one HTTP/1.1|host-has-port=true|content-type-lines=0||body=
+GET /two HTTP/1.1|host-has-port=true|content-type-lines=0||body=
+POST /hook?k=v HTTP/1.1|host-has-port=true|content-type-lines=1||body={}
+POST /dup HTTP/1.1|host-has-port=true|content-type-lines=1|X-Multi: one, two|body={}

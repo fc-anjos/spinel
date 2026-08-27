@@ -1794,6 +1794,7 @@ static int source_references_set(const char *src) {
    sp_feature_enabled(). Definitions here (spinel_parse.c includes no project
    headers); declared extern in compiler.h. */
 int g_require_gate = 0;
+int g_require_gate_cli = 0;   /* --require-gate */
 static char *sp_req_feats[128];
 static int sp_req_feats_n = 0;
 
@@ -3161,7 +3162,10 @@ static int sp_parse_emit(const char *source_file, const char *argv0, SpStrBuf *o
     sp_mark_path_included(entry_canon);
     free(entry_canon);
   }
-  g_require_gate = getenv("SPINEL_REQUIRE_GATE") ? 1 : 0;
+  /* `--require-gate` is the flag spelling of SPINEL_REQUIRE_GATE. An env
+     assignment cannot ride inside a flag string, and `spin flags` has to hand
+     a caller's Makefile the same gate `spin build` compiles under. */
+  g_require_gate = (g_require_gate_cli || getenv("SPINEL_REQUIRE_GATE")) ? 1 : 0;
   /* CRuby (3.2+) provides Set without an explicit require. Mirror it: when
      the program references the Set constant or calls to_set and never
      requires "set" (and doesn't define its own Set), prepend the require so

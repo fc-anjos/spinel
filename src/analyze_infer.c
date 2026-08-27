@@ -168,7 +168,15 @@ TyKind ie_block_break_next_ty(Compiler *c, int node) {
   if (sp_streq(ty, "BreakNode") || sp_streq(ty, "NextNode")) {
     int a = nt_ref(nt, node, "arguments"); int an = 0;
     const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
-    return an > 0 ? infer_type(c, av[0]) : TY_UNKNOWN;
+    if (an > 0) {
+      /* `next *x` delivers the splat-built ARRAY, not the element type that
+         infer_type reports for a SplatNode in an array literal. */
+      const char *aty = nt_type(nt, av[0]);
+      if (aty && sp_streq(aty, "SplatNode")) return TY_POLY_ARRAY;
+      return infer_type(c, av[0]);
+    }
+    /* a bare `next` yields nil: `[1,2].map { |v| next if v == 1; v }` is [nil, 2] */
+    return sp_streq(ty, "NextNode") ? TY_NIL : TY_UNKNOWN;
   }
   if (sp_streq(ty, "WhileNode") || sp_streq(ty, "UntilNode") || sp_streq(ty, "ForNode") ||
       sp_streq(ty, "BlockNode") || sp_streq(ty, "LambdaNode") || sp_streq(ty, "DefNode") ||
@@ -2605,6 +2613,8 @@ else {
     if (rty && sp_streq(rty, "ConstantReadNode") &&
         nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Marshal")) {
       if (sp_streq(name, "dump") && argc == 1) return TY_STRING;
+      /* Marshal.dump(obj, io) writes the bytes to io and answers io (#4112) */
+      if (sp_streq(name, "dump") && argc == 2) return TY_IO;
       if (sp_streq(name, "load") && argc == 1) return TY_POLY;
     }
     if (rty && sp_streq(rty, "ConstantReadNode") &&
@@ -3961,11 +3971,6 @@ else {
   }
 
   /* array receiver methods */
-  /* a bare [] literal receiver types UNKNOWN until pushes promote it, but
-     its blockless each is still an Enumerator */
-  if (recv >= 0 && rt == TY_UNKNOWN && nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ArrayNode") &&
-      nt_ref(nt, id, "block") < 0 && argc == 0 &&
-      (sp_streq(name, "each") || sp_streq(name, "reverse_each"))) return TY_ENUMERATOR;
   /* Array receivers: the array face of infer_call (analyze_infer_recv.c). */
   { TyKind rr; if (infer_array_call(c, id, rt, &rr)) return rr; }
 
@@ -4197,6 +4202,13 @@ else {
           (sp_streq(name, "scrub") && argc == 1) ||
           (sp_streq(name, "encode") && (argc == 1 || argc == 2)))
         return an_poly_concrete(c, name, TY_POLY);
+      /* chomp / chop / delete_prefix / delete_suffix answer a String and are
+         served at argc 0 only, so the separator forms -- `line.chomp("|")`,
+         which is what a line reader does with its own separator -- fell to
+         NoMethodError on a boxed receiver with a clean C build. */
+      if (argc == 1 && (sp_streq(name, "chomp") || sp_streq(name, "delete_prefix") ||
+                        sp_streq(name, "delete_suffix")))
+        return an_poly_concrete(c, name, TY_STRING);
       /* poly.ljust/rjust/center(width[, pad]): a String read from a container
          widened to poly; emit_poly_call pads via sp_poly_to_s and re-boxes, so
          the result stays poly (#3222). */
@@ -4259,6 +4271,8 @@ else {
           int body = nt_ref(nt, blk, "body");
           int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
           TyKind et = bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN;
+          TyKind bnt = ie_block_break_next_ty(c, body);
+          if (bnt != TY_UNKNOWN) et = (et == TY_UNKNOWN) ? bnt : ty_unify(et, bnt);
           return et != TY_UNKNOWN ? ty_array_of(et) : TY_POLY_ARRAY;
         }
       }
@@ -4359,9 +4373,39 @@ else {
          the other side. */
       if (found && !an_builtin_only && r != TY_POLY && r != TY_UNKNOWN &&
           recv >= 0 && an_user_defines_or_reads(c, name)) {
-        an_builtin_only = 1;
-        TyKind bt = infer_call(c, id);
-        an_builtin_only = 0;
+        /* Asking costs a full re-inference of the call, and the same node is
+           asked many times inside one fixpoint iteration: counted on a 51k-line
+           Rails emit, 294,164 asks over 18k nodes, 96% of them a repeat of a
+           node already asked in that same iteration.  Memoize per node on the
+           narrow generation, which is bumped once per iteration and so releases
+           every answer when the types move.
+           The answer is stable across the repeats but not perfectly: on the same
+           tree 2 asks of 87,033 saw it change mid-iteration (TY_ENUMERATOR then
+           TY_UNKNOWN, for one name).  The memo pins the first answer, so those
+           take the earlier one.  It changed no output on either app measured. */
+        long bk = narrow_key(3, id, "");
+        int bhit; int bcached = narrow_memo_get(bk, &bhit);
+        TyKind bt;
+        /* A cached answer is trusted only while it says "no disagreement",
+           which is the common case and where the whole win is -- 2 asks of
+           87,033 were measured changing mid-iteration, so the rest hit. The
+           answer that WIDENS is the consequential one, and the one those two
+           were, so confirm it against a fresh ask rather than pinning a stale
+           one. Pinning it widened calls that should have stayed typed: a
+           concrete object became TY_POLY, its direct call became a runtime
+           cls_id switch with a NoMethodError arm, and four rubyspec examples
+           went with it (an identity assertion through .equal? cannot survive
+           the value boxing). */
+        int btrust = bhit && ((TyKind)bcached == TY_UNKNOWN ||
+                              (TyKind)bcached == TY_VOID ||
+                              (TyKind)bcached == r);
+        if (btrust) { bt = (TyKind)bcached; }
+        else {
+          an_builtin_only = 1;
+          bt = infer_call(c, id);
+          an_builtin_only = 0;
+          narrow_memo_put(bk, (int)bt);
+        }
         if (bt != TY_UNKNOWN && bt != TY_VOID && bt != r) return TY_POLY;
       }
       if (found) return r;
@@ -4620,7 +4664,10 @@ else {
       int body = nt_ref(nt, block, "body");
       int bn = 0;
       const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-      return ty_array_of(bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN);
+      TyKind et = bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN;
+      TyKind bnt = ie_block_break_next_ty(c, body);
+      if (bnt != TY_UNKNOWN) et = (et == TY_UNKNOWN) ? bnt : ty_unify(et, bnt);
+      return ty_array_of(et);
     }
   }
 
@@ -6125,12 +6172,15 @@ TyKind infer_uncached(Compiler *c, int id) {
     int n = 0;
     const int *els = nt_arr(nt, id, "elements", &n);
     if (n == 0) {
-      /* An empty `[]` used as a whitelisted iterator's receiver must still
-         dispatch (`[].each { }`): type it as an empty poly array. Elsewhere it
-         stays UNKNOWN so `x = []; x << 1` can back-fill the element type and the
-         non-block empty-literal folds keep working. */
+      /* An empty `[]` consumed directly as a receiver or interpolation has no
+         writes to infer from, so mark_empty_array_operands types it as a poly
+         array. An argument may instead take a specific layout through arr_want.
+         Elsewhere it stays UNKNOWN so `x = []; x << 1` can back-fill its kind. */
       if (c->empty_arr_recv && id < c->node_cap && c->empty_arr_recv[id])
         return TY_POLY_ARRAY;
+      /* kind fixed by the use context (mark_empty_array_operands) */
+      if (c->arr_want && id < c->node_cap && ty_is_array(c->arr_want[id]))
+        return c->arr_want[id];
       return TY_UNKNOWN;  /* empty: element type comes from usage */
     }
     TyKind e = TY_UNKNOWN;

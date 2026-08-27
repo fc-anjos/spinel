@@ -1,0 +1,19 @@
+"alpha\n"
+"beta"
+"gam"
+"ma\n"
+nil
+""
+true
+"0123"
+"456789"
+["a\n", "b\n", "c\n"]
+["x\n", "y\n"]
+65
+"B"
+nil
+"one|"
+"tw"
+"abcde\n\n"
+"only\n"
+EOFError: end of file reached

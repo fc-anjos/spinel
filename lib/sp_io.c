@@ -754,6 +754,38 @@ sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc
   if (errno == EISCONN) return 0;
   sp_file_raise_errno("connect", host ? host : "");
 }
+/* connect_nonblock(sockaddr). The peer is already resolved into a packed
+   struct sockaddr (the binary String returned by Socket.sockaddr_in or
+   #to_sockaddr on an Addrinfo). connect(2) takes the raw bytes; we just
+   pass them through. Same nonblocking lifecycle as sp_sock_connect_nb. */
+sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool exc) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
+  /* sp_sock_nb_prepare runs first: it checks the closed-socket and
+     wrong-class guards and raises the matching exception (e.g. IOError
+     "closed stream") before we touch the address. The sa/salen guard
+     comes after, sets errno = EINVAL, and routes through the same
+     errno->raise path every other socket op uses. */
+  sp_sock_nb_prepare(f, "connect_nonblock");
+  if (!sa || salen <= 0) {
+    errno = EINVAL;
+    sp_file_raise_errno("connect", "");
+  }
+  int saved = sp_io_nb_begin(f);
+  int rc = connect(fileno(f->fp), (const struct sockaddr *)sa, (socklen_t)salen);
+  int ce = errno;
+  sp_io_nb_end(f, saved);
+  errno = ce;
+  if (rc == 0) return 0;
+  if (errno == EINPROGRESS || errno == EALREADY) {
+    if (!exc) return SP_INT_NIL;
+    sp_raise_cls("IO::EINPROGRESSWaitWritable", "operation in progress - connect(2) would block");
+  }
+  /* Already connected answers 0, the same as the two-argument form above and
+     the same as CRuby answers here -- measured on both, in both exception
+     modes, including a second connect to a different address. */
+  if (errno == EISCONN) return 0;
+  sp_file_raise_errno("connect", "");
+  return -1;
+}
 
 /* TCPServer#accept: park cooperatively for a pending connection first -- a
    blocking accept would stall the whole green-thread scheduler -- then wrap the

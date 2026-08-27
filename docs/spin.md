@@ -201,6 +201,57 @@ intptr_t fast_quad(intptr_t x) { return x * 4; }
 objects into every dependent build. External libraries use the existing
 `ffi_lib` declaration and need no manifest entry.
 
+### Excluding C from the build
+
+`.rb` enters the build by being required; `.c` enters by being there. That is
+what lets a package carry native code without listing it, and it is the wrong
+default when a repository holds a C program of its own — a `main()` beside the
+Ruby will collide with the generated one at link time. `exclude` names what is
+not part of this build:
+
+```toml
+[package]
+name = "myapp"
+exclude = ["standalone_c_app.c", "c_lib*.c", "cbits"]
+```
+
+Globs are relative to the package root; naming a directory prunes all of it.
+`exclude` covers native discovery only — `.rb` needs no entry, since nothing
+compiles it unless something requires it, and an excluded `.h` is still on the
+include path for the C that is compiled. An application scaffolded by
+`spin new` has no `[package]` table; add one to use the field.
+
+## Building outside spin
+
+`spin build` owns the tree it sits in. When the build is driven from somewhere
+else — a Makefile that also builds a C program, a repository whose layout is
+not spin's to arrange — `spin flags` hands over instead of taking over. It
+resolves the dependencies, compiles any carried C into the cache, and prints
+the compiler flags that implies:
+
+```console
+$ spin flags
+--require-gate -I /path/pkgs/curses -I /path/backend --link ~/.cache/spin/native/curses-0.1.0-cc/sp_curses.o
+```
+
+Every path is absolute, so the caller's working directory can be anywhere:
+
+```make
+SPINFLAGS := $(shell cd spin/backend && spin flags)
+
+ruby_app.exe: ruby_app.rb $(RUBY_SRCS)
+	spinel $(SPINFLAGS) -I . $< -o $@
+```
+
+What it prints is what `spin build` compiles with, minus the entry file and
+`-o`; the two come from one place, so they cannot drift.
+
+Nothing here is required to consume a package by hand. `require "curses"`
+resolves against any `-I` root as `<root>/curses.rb` or
+`<root>/curses/curses.rb`, so `spinel -I spin/packages` finds a package sitting
+at `spin/packages/curses/`, and `--link` takes its compiled object. `spin
+flags` is the part that works out which roots and which objects.
+
 ## Rebuilds
 
 `spin build`/`run`/`test` skip recompilation when nothing changed (input
@@ -219,10 +270,30 @@ objects are reused from the cache. `spin clean` removes `build/`.
 | `spin test [file..] [--regen]` | run `test/*.rb` against snapshots |
 | `spin add` / `remove` | edit `[dependencies]` and relock |
 | `spin lock` / `fetch` / `vendor` | pin / warm the cache / copy into `vendor/` |
+| `spin flags` | print the compiler flags this project implies, for a build driven from outside spin |
 | `spin list` / `tree` / `search` (`--json`) | inspect the resolved set / the index |
 | `spin publish [--direct]` | validate + test, then submit this release to the index |
 | `spin install [name..]` | build and copy `bin/` executables to `~/.local/bin` (`--prefix`, `--uninstall`) |
 | `spin clean` | remove `build/` |
 
 Environment: `SPIN_INDEX` (index URL), `SPIN_OFFLINE=1` (cache/vendor
-only), `CC` (toolchain for package C).
+only), `CC` (toolchain for package C), `SPIN_NATIVE_CACHE` (where compiled
+package objects go, default `$XDG_CACHE_HOME/spin/native`),
+`SPIN_NO_NATIVE_CACHE=1` (recompile package C every time),
+`SPINEL_HDR_DIR` (where the runtime headers are, when spin cannot work it out
+from the compiler's own path).
+
+### When the cache is in the way
+
+Package `.c` files compile into a shared cache keyed by (package, version,
+toolchain), so the same package is not rebuilt for every consumer. That is
+worth having across projects and unhelpful while debugging one: a run behaves
+differently depending on whether an object happens to be there already, which
+is exactly what you do not want when you are trying to find out why a build
+differs. `SPIN_NO_NATIVE_CACHE=1` makes every run start from the same state,
+and `SPIN_NATIVE_CACHE=<dir>` puts the objects somewhere you can delete.
+
+Note what it does and does not save. The objects are the cheap half: hand-
+written C compiles in milliseconds, while whole-program type inference over
+the Ruby is where the time goes. The cache exists so a package is not
+recompiled once per consuming project, not to make a single build fast.

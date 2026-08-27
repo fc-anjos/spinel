@@ -2749,15 +2749,6 @@ sp_int sp_float_to_i_checked(sp_float f) {
 
 /* ---- Box helpers (0 optcarrot uses) -- relocated from spinel_rt.h. ---- */
 
-/* Boxing a nullable-int value (int?): SP_INT_NIL is the reserved nil sentinel
-   and never a legitimate integer, so a sentinel must surface as Ruby nil rather
-   than a boxed INT_MIN. Used when an int? value (hash miss, rindex, nonzero?,
-   ...) flows into a poly slot. */
-sp_RbVal sp_box_int_or_nil(sp_int v) { return v == SP_INT_NIL ? sp_box_nil() : sp_box_int(v); }
-/* The float counterpart. A float slot spells nil with its own reserved
-   sentinel, and boxing that as an ordinary Float made it a Hash key that no
-   literal nil could match (#3493). */
-sp_RbVal sp_box_float_or_nil(sp_float v) { return sp_float_is_nil(v) ? sp_box_nil() : sp_box_float(v); }
 /* An element read back out of a TYPED array boxes at the runtime read, which
    has no room for the sentinel check the hot path cannot afford. Where analyze
    knows a particular receiver's elements can hold one, it wraps that read in
@@ -3006,9 +2997,19 @@ sp_File *sp_io_wait_events(sp_File *f, double timeout, sp_int kind) {SP_GC_ROOT(
 /* IO.select(read, write, error, timeout) -> [ready_read, ready_write,
    ready_error], or nil when the timeout expires first. A nil array stands for
    "watch nothing", so all three nil is just a sleep. */
+sp_File *(*sp_user_to_io_hook)(sp_RbVal) = NULL;
 static sp_File *sp_select_io_of(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_IO && v.v.p) return (sp_File *)v.v.p;
-  sp_raise_cls("TypeError", "no implicit conversion into IO");
+  /* A user object that answers #to_io names the handle to wait on -- CRuby
+     waits on wrappers this way, and a TLS socket is one. */
+  if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && sp_user_to_io_hook) {
+    sp_File *f = sp_user_to_io_hook(v);
+    if (f) return f;
+  }
+  sp_raise_cls("TypeError",
+               sp_sprintf("no implicit conversion of %s into IO",
+                          (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && sp_obj_cls_name_fn)
+                            ? sp_obj_cls_name_fn(v.cls_id) : "nil"));
   return NULL;
 }
 sp_RbVal sp_io_select(sp_PolyArray *rd, sp_PolyArray *wr, sp_PolyArray *er, double timeout) {

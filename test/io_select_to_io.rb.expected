@@ -1,0 +1,9 @@
+true
+false
+1
+true
+"hi"
+false
+true
+2
+TypeError: no implicit conversion of NotAnIo into IO

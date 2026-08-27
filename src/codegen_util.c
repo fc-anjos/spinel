@@ -554,6 +554,7 @@ int g_has_user_cmp = 0;
 int g_has_user_binop = 0;
 TyKind g_ie_next_ty = TY_UNKNOWN;
 int g_has_user_coerce = 0;
+int g_has_user_to_io = 0;
 int g_gen_obj_hashkey = 0;
 int g_gen_obj_valeq = 0;
 int g_re_init_needed = 0;
@@ -1688,9 +1689,18 @@ const char *mc(const char *name) {
    underscore protected the namespace and left the identifier open, so `def
    sym` collided with the typedef and the program failed to build on a C
    diagnostic that never mentions the name the author wrote. */
-const char *mc_top(const char *name) {
+const char *mc_top(Compiler *c, const char *name) {
   static char buf[272];
   const char *m = mc(name);
+  /* A class or module of the same name owns sp_<Name> as its typedef, and
+     `def Foo` beside `class Foo` is ordinary Ruby -- URI(), Integer(),
+     Array() are all a method sharing a name with a type. Without this the two
+     collide and the program fails to build on a C diagnostic that never
+     mentions either. Same remedy as the runtime clash below. */
+  if (c && comp_class_index(c, name) >= 0) {
+    snprintf(buf, sizeof buf, "rb_%s", m);
+    return buf;
+  }
   const char *us = strchr(m, '_');
   size_t seg = (us && us > m) ? (size_t)(us - m) : strlen(m);
   if (seg > 0) {

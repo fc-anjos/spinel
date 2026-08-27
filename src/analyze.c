@@ -126,6 +126,10 @@ static int method_name_implicitly_invoked(const char *nm) {
     "to_s", "inspect", "==", "<=>", "eql?", "hash", "each", "coerce",
     "to_str", "to_ary", "to_a", "to_i", "to_int", "to_h", "to_hash", "to_proc", "call",
     "to_path",   /* File, Dir and IO's path slots ask it first (rb_get_path) */
+    "to_io",     /* IO.select waits on whatever answers it; the only caller is
+                    the generated dispatch behind sp_user_to_io_hook, so nothing
+                    in the program names it (#4105-adjacent, the TLS socket
+                    shape) */
     "initialize_copy",
     /* the materializer synthesized for a class that includes Enumerable: the
        generated sp_obj_to_a dispatch calls it for an instance the poly
@@ -7481,69 +7485,70 @@ static void narrow_nil_guard_params(Compiler *c) {
   }
 }
 
-/* Mark every empty `[]` literal used as the receiver of a whitelisted iterator
-   (`[].each { }`, `[].map { }`, ...), so infer_uncached types it TY_POLY_ARRAY
-   and the iterator dispatches over an empty poly array instead of aborting on an
-   unresolved receiver. Restricted to iterators whose empty-poly-array codegen is
-   known-good; the non-block empty-literal folds (`[].sum(n)`, `[].reduce(i,:s)`)
-   and the `x = []` element back-fill are on other nodes, so both are untouched. */
-static int empty_arr_iter_ok(const char *nm) {
+/* An empty `[]` infers TY_UNKNOWN so `x = []; x << 1` can back-fill from the
+   writes. A literal consumed on the spot has no writes to wait for, so it takes
+   its kind from the use: a receiver or interpolation is a poly array; an
+   argument to a typed-array method is that array's kind when the method
+   combines arrays (`+`, `concat`, `==`, ...) and a poly array otherwise.
+   Runs after the fixpoint, where receiver kinds are settled. */
+static int empty_arr_same_kind_method(const char *nm) {
   static const char *const ok[] = {
-    "each", "map", "collect", "select", "filter", "reject", "filter_map",
-    "find", "detect", "each_with_object",
-    "group_by", "sort_by", "min_by", "max_by", "flat_map",
-    "reduce", "inject",
-    /* the block forms that were still refusing an empty literal receiver */
-    "partition", "take_while", "drop_while", "each_with_index",
-    /* the cycling block forms, which were refused for the same reason: an
-       empty literal receiver has no array kind for the loop (#3852) */
-    "cycle", "each_slice", "each_cons", "each_entry",
-    /* tap / then yield the receiver itself rather than an element, but they
-       need its kind for the same reason: without one the block parameter had
-       no type and the binding declared a `void` temp (#3929). */
-    "tap", "then", "yield_self", NULL };
+    "+", "-", "&", "|", "==", "!=", "<=>", "eql?", "concat", "replace",
+    "union", "intersection", "difference", "intersect?", "equal?", NULL };
   for (int i = 0; ok[i]; i++) if (sp_streq(nm, ok[i])) return 1;
   return 0;
 }
-static void mark_empty_array_receivers(Compiler *c) {
-  if (!c->empty_arr_recv) return;
+static int is_empty_array_literal(const NodeTable *nt, int id, int cap) {
+  if (id < 0 || id >= cap || nt_kind(nt, id) != NK_ArrayNode) return 0;
+  int en = 0; nt_arr(nt, id, "elements", &en);
+  return en == 0;
+}
+static void mark_empty_array_operands(Compiler *c) {
+  if (!c->empty_arr_recv || !c->arr_want) return;
   const NodeTable *nt = c->nt;
-  for (int id = 0; id < nt->count; id++) {
-    const char *ty = nt_type(nt, id);
-    if (!ty || !sp_streq(ty, "CallNode")) continue;
+  NT_FOREACH_KIND(nt, NK_EmbeddedStatementsNode, es) {
+    int st = nt_ref(nt, es, "statements");
+    int bn = 0; const int *bb = st >= 0 ? nt_arr(nt, st, "body", &bn) : NULL;
+    if (bn == 1 && is_empty_array_literal(nt, bb[0], c->node_cap)) c->empty_arr_recv[bb[0]] = 1;
+  }
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
     const char *nm = nt_str(nt, id, "name");
-    /* product takes no block; max/min/sample WITH a count arg take no block
-       but return an array (via the PolyArray sort/shuffle path) -- an empty
-       int-array literal there would be passed to sp_PolyArray_* as an
-       sp_IntArray* (#2864). Everything else on the list is block-gated so the
-       non-block empty-literal folds (sum, inject(:sym), first) keep their arms. */
-    int has_block = nt_ref(nt, id, "block") >= 0;
-    int count_form = 0;
-    if (nm && (sp_streq(nm, "max") || sp_streq(nm, "min") || sp_streq(nm, "sample"))) {
-      int an = nt_ref(nt, id, "arguments"); int ac = 0;
-      if (an >= 0) nt_arr(nt, an, "arguments", &ac);
-      count_form = (ac == 1);
-    }
-    /* blockless zip pairs elementwise into a PolyArray of PolyArrays: an
-       untyped empty literal receiver had no array kind, so the call fell
-       through to the set-op arm and emitted sp_<T>Array_difference (#3332) */
-    int zip_form = nm && sp_streq(nm, "zip") && !has_block;
-    /* blockless forms that answer an Enumerator (or a plain value) over the
-       elements: with no array kind on the receiver, no arm claimed them and
-       the call was refused outright (#3618) */
-    int enum_form = nm && !has_block &&
-                    (sp_streq(nm, "each_with_index") ||
-                     sp_streq(nm, "each_entry") || sp_streq(nm, "frozen?"));
-    if (!has_block && !(nm && sp_streq(nm, "product")) && !count_form && !zip_form &&
-        !enum_form) continue;
-    if (!nm || (!empty_arr_iter_ok(nm) && !sp_streq(nm, "product") && !count_form &&
-                !zip_form && !enum_form)) continue;
     int recv = nt_ref(nt, id, "receiver");
     if (recv < 0 || recv >= c->node_cap) continue;
-    const char *rty = nt_type(nt, recv);
-    if (!rty || !sp_streq(rty, "ArrayNode")) continue;
-    int en = 0; nt_arr(nt, recv, "elements", &en);
-    if (en != 0) continue;
+    int anode = nt_ref(nt, id, "arguments");
+    int an = 0; const int *av = anode >= 0 ? nt_arr(nt, anode, "arguments", &an) : NULL;
+    int recv_empty = is_empty_array_literal(nt, recv, c->node_cap);
+    /* an inject / each_with_object seed is written through the block param
+       and back-fills like a local: leave it */
+    int seed = nt_ref(nt, id, "block") >= 0 && nm &&
+               (sp_streq(nm, "each_with_object") || sp_streq(nm, "inject") || sp_streq(nm, "reduce"));
+    if (an > 0 && nm && !recv_empty) {
+      TyKind rt = infer_type(c, recv);
+      if ((ty_is_array(rt) && !seed) || ty_is_hash(rt)) {
+        TyKind want = (ty_is_array(rt) && rt != TY_POLY_ARRAY && empty_arr_same_kind_method(nm))
+                      ? rt : TY_POLY_ARRAY;
+        for (int k = 0; k < an; k++)
+          if (is_empty_array_literal(nt, av[k], c->node_cap) && c->arr_want[av[k]] == TY_UNKNOWN)
+            c->arr_want[av[k]] = want;
+      }
+    }
+    if (!recv_empty) continue;
+    /* `[] + a` takes a's kind ... */
+    if (an == 1 && nm && empty_arr_same_kind_method(nm) && c->arr_want[recv] == TY_UNKNOWN) {
+      TyKind at = infer_type(c, av[0]);
+      if (ty_is_array(at) && at != TY_POLY_ARRAY) { c->arr_want[recv] = at; continue; }
+    }
+    /* When both operands are bare `[]`, the receiver becomes a poly array but
+       the argument has no independently inferred kind. Give that argument the
+       same poly layout before codegen; otherwise `[] == []` / `[] | []` pass
+       the default sp_IntArray* into a path expecting sp_PolyArray*. Seeds keep
+       their existing back-fill behavior through the block parameter. */
+    if (!seed) {
+      for (int k = 0; k < an; k++)
+        if (is_empty_array_literal(nt, av[k], c->node_cap) && c->arr_want[av[k]] == TY_UNKNOWN)
+          c->arr_want[av[k]] = TY_POLY_ARRAY;
+    }
+    /* ... any other bare `[]` receiver is an empty poly array */
     c->empty_arr_recv[recv] = 1;
     /* The marking gives the receiver an element type, but a block parameter is
        interned only where something reads it. With neither -- `[].map { |x| 1 }`
@@ -7564,9 +7569,6 @@ static void mark_empty_array_receivers(Compiler *c) {
     }
   }
 }
-/* A direct empty `{}` literal receiver of a block method (`{}.select { }`)
-   infers TY_UNKNOWN and can't dispatch; mark it so infer types it as the
-   bare-{} hash (STR_POLY), the same fallback a never-narrowed `{}` local uses. */
 /* A method whose body TAIL is a bare empty `[]` / `{}` literal returns that
    container, but an unmarked empty literal infers TY_UNKNOWN (its element
    type normally back-fills from usage), so the method collapsed to a void C
@@ -7978,15 +7980,18 @@ static int mark_empty_hash_key_ctx(Compiler *c) {
        read does, but they are not CallNodes, so the name gate below never saw
        them and an Integer key fell back to StrPolyHash (#3353) */
     int is_idx_write = (idk == NK_IndexOrWriteNode || idk == NK_IndexAndWriteNode ||
-                        idk == NK_IndexOperatorWriteNode);
+                        idk == NK_IndexOperatorWriteNode || idk == NK_IndexTargetNode);
     if (idk != NK_CallNode && !is_idx_write) continue;
     const char *nm = is_idx_write ? "[]" : nt_str(nt, id, "name");
     /* `[]=` / `store` name the key in arg 0 exactly as the reads do, and say
-       the same thing about which variant the literal has to be (#4026). */
-    if (!nm || (!sp_streq(nm, "fetch") && !sp_streq(nm, "[]") &&
-                !sp_streq(nm, "[]=") && !sp_streq(nm, "store") &&
-                !sp_streq(nm, "key?") && !sp_streq(nm, "has_key?") &&
-                !sp_streq(nm, "include?") && !sp_streq(nm, "dig"))) continue;
+       the same thing about which variant the literal has to be (#4026), as do
+       the other key-taking methods. */
+    static const char *const key_ops[] = {
+      "fetch", "[]", "[]=", "store", "key?", "has_key?", "include?", "member?",
+      "dig", "slice", "except", "values_at", "fetch_values", "assoc", "delete", NULL };
+    int is_key_op = 0;
+    for (int k = 0; nm && key_ops[k] && !is_key_op; k++) if (sp_streq(nm, key_ops[k])) is_key_op = 1;
+    if (!is_key_op) continue;
     int recv = nt_ref(nt, id, "receiver");
     if (recv < 0 || recv >= c->node_cap) continue;
     /* A `tap` / `then` block parameter is another name for the call's own
@@ -8221,15 +8226,6 @@ static void mark_empty_hash_enum_locals(Compiler *c) {
     if (!hit) continue;
     int recv = nt_ref(nt, id, "receiver");
     if (recv < 0) continue;
-    /* the same call on a direct empty literal: the receiver marking only
-       covered the block forms, so a blockless `{}.each_slice(2)` had no hash
-       to build an Enumerator from (#3856) */
-    if ((nt_kind(nt, recv) == NK_HashNode || nt_kind(nt, recv) == NK_KeywordHashNode) &&
-        recv < c->node_cap) {
-      int en0 = 0; nt_arr(nt, recv, "elements", &en0);
-      if (en0 == 0) c->empty_hash_recv[recv] = 1;
-      continue;
-    }
     if (nt_kind(nt, recv) != NK_LocalVariableReadNode) continue;
     const char *lname = nt_str(nt, recv, "name");
     Scope *rs = comp_scope_of(c, recv);
@@ -8264,19 +8260,26 @@ static void mark_empty_hash_enum_locals(Compiler *c) {
     if (ok && lit >= 0 && lit < c->node_cap) c->empty_hash_recv[lit] = 1;
   }
 }
+static int is_empty_hash_literal(const NodeTable *nt, int id, int cap) {
+  if (id < 0 || id >= cap) return 0;
+  NodeKind k = nt_kind(nt, id);
+  if (k != NK_HashNode && k != NK_KeywordHashNode) return 0;
+  int en = 0; nt_arr(nt, id, "elements", &en);
+  return en == 0;
+}
+/* A bare `{}` receiver or interpolation takes the bare-hash default (see
+   mark_empty_array_operands); a key operation refines it in mark_empty_hash_key_ctx. */
 static void mark_empty_hash_receivers(Compiler *c) {
   if (!c->empty_hash_recv) return;
   const NodeTable *nt = c->nt;
-  for (int id = 0; id < nt->count; id++) {
-    const char *ty = nt_type(nt, id);
-    if (!ty || !sp_streq(ty, "CallNode")) continue;
-    if (nt_ref(nt, id, "block") < 0) continue;
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
     int recv = nt_ref(nt, id, "receiver");
-    if (recv < 0 || recv >= c->node_cap) continue;
-    const char *rty = nt_type(nt, recv);
-    if (!rty || (!sp_streq(rty, "HashNode") && !sp_streq(rty, "KeywordHashNode"))) continue;
-    int en = 0; nt_arr(nt, recv, "elements", &en);
-    if (en == 0) c->empty_hash_recv[recv] = 1;
+    if (is_empty_hash_literal(nt, recv, c->node_cap)) c->empty_hash_recv[recv] = 1;
+  }
+  NT_FOREACH_KIND(nt, NK_EmbeddedStatementsNode, es) {
+    int st = nt_ref(nt, es, "statements");
+    int bn = 0; const int *bb = st >= 0 ? nt_arr(nt, st, "body", &bn) : NULL;
+    if (bn == 1 && is_empty_hash_literal(nt, bb[0], c->node_cap)) c->empty_hash_recv[bb[0]] = 1;
   }
 }
 
@@ -10387,6 +10390,31 @@ int nullable_int_elem_read(Compiler *c, int call) {
          nullable_int_elem_expr(c, recv, 0);
 }
 
+/* A call that answers one element of its receiver, or nil when there is none
+   (`a[i]`, `h[k]`, `[].max`, `a.find { }`), plus `Integer(s, exception: false)`. */
+static int elem_miss_call(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  const char *nm = nt_str(nt, v, "name");
+  if (!nm) return 0;
+  int recv = nt_ref(nt, v, "receiver");
+  int args = nt_ref(nt, v, "arguments");
+  int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  int blk = nt_ref(nt, v, "block");
+  if (recv < 0) {
+    if ((sp_streq(nm, "Integer") || sp_streq(nm, "Float")) && argc >= 2 && argv &&
+        nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) return 1;
+    return 0;
+  }
+  if (sp_streq(nm, "[]") || sp_streq(nm, "at")) return argc == 1 && blk < 0;
+  if (sp_streq(nm, "dig")) return argc >= 1;
+  if (sp_streq(nm, "first") || sp_streq(nm, "last") || sp_streq(nm, "sample"))
+    return argc == 0 && blk < 0;
+  if (sp_streq(nm, "min") || sp_streq(nm, "max")) return argc == 0;
+  if (sp_streq(nm, "min_by") || sp_streq(nm, "max_by")) return argc == 0 && blk >= 0;
+  if (sp_streq(nm, "find") || sp_streq(nm, "detect")) return blk >= 0;
+  return 0;
+}
+
 /* Can this expression leave the sentinel in an int slot? */
 int nullable_int_value(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
@@ -10465,6 +10493,9 @@ int nullable_int_value(Compiler *c, int v) {
   }
   if (nt_kind(nt, v) == NK_CallNode) {
     if (nullable_int_call_name(nt_str(nt, v, "name"))) return 1;
+    /* a missed element read is the sentinel in an int slot; only boxing is
+       affected, typed reads keep their inline arms */
+    if (elem_miss_call(c, v)) return 1;
     /* a method whose --rbs signature pins `Integer?`, or whose own return
        expression can be the sentinel: either way its nil is the sentinel and a
        caller that boxes the value has to answer nil. Resolved the way emission
@@ -11270,6 +11301,7 @@ void analyze_program(Compiler *c) {
                                             then the lambda block attaches) */
   desugar_rightward_nested_pattern(c);   /* `x => {k: C(v:)}` -> one-arm case/in */
   desugar_sort_by_with_index(c);         /* sort_by.with_index -> each_with_index.sort_by */
+  desugar_forwarding_to_rest_callee(c);  /* def m(...) = f(*a, **k) -> anon *, ** */
   desugar_block_implicit_rest(c);        /* |x,| -> |x, __implicit_rest| (destructures) */
   desugar_block_destructure_params(c);   /* |a,(b,c),d| -> flat param + `b,c = __destr` */
   desugar_enumerator_produce(c);         /* Enumerator.produce -> fiber generator */
@@ -13096,7 +13128,7 @@ void analyze_program(Compiler *c) {
     for (int i = 0; i < c->scopes[s].nlocals; i++)
       c->scopes[s].locals[i].gc_root = (c->scopes[s].locals[i].type == TY_STRING);
 
-  mark_empty_array_receivers(c);
+  mark_empty_array_operands(c);
   for (int id = 0; id < c->nt->count; id++)
     infer_type(c, id);
 
@@ -13897,6 +13929,9 @@ void analyze_program(Compiler *c) {
       LocalVar *wv = scope_local(sc2, wn);
       if (!rv || !wv || rv->type == wv->type) continue;
       if (!ty_is_array(rv->type) && rv->type != TY_POLY) continue;
+      /* a local already unified to poly holds other kinds too
+         (`r = x.pop; r = x.concat([3])`); it stays poly */
+      if (!ty_is_array(wv->type)) continue;
       wv->type = rv->type;
       c->ntype[v] = rv->type;
       NT_FOREACH_KIND(c->nt, NK_LocalVariableReadNode, rid) {
@@ -14081,4 +14116,3 @@ void analyze_program(Compiler *c) {
      uncelled, and the emit refuses. Only sets is_cell, and is idempotent. */
   mark_proc_captures(c);
 }
-

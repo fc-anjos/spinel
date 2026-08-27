@@ -351,6 +351,7 @@ extern int g_uses_threads;
 extern int g_has_user_cmp;
 extern int g_has_user_binop;
 extern int g_has_user_coerce;
+extern int g_has_user_to_io;
 extern int g_gen_obj_hashkey; /* >=1 instantiated class defines #hash + #eql?: emit + install the obj hash/eql key hooks */
 extern int g_gen_obj_valeq;   /* >=1 instantiated Struct/Data class: emit + install the value-== hook so containers compare them by value */
 extern int g_re_init_needed;
@@ -518,6 +519,7 @@ const char *sp_re_literal_error(const char *src, int len, int flags);
    or 0 if the name is not a recognized builtin class. */
 int builtin_class_id(const char *name);
 int is_builtin_class_name(const char *n);
+int is_builtin_module_name(const char *n);
 int is_builtin_exception_name(const char *n);
 const char *c_type_name(TyKind t);
 int is_scalar_ret(TyKind t);
@@ -574,7 +576,7 @@ const char *bigint_arith_fn(const char *op);
    `=`->_set, anything else non-identifier -> `_`. Returns a static buffer
    (one live result at a time -- fine since each use is consumed inline). */
 const char *mc(const char *name);
-const char *mc_top(const char *name);
+const char *mc_top(Compiler *c, const char *name);
 const char *iv_c(const char *name);  /* ivar/member name -> valid C field id (#3110) */
 /* A class method scope is shadowed (and must not be emitted) when a later
    scope redefines the same (class, name, is_cmethod) -- a reopened class
@@ -754,6 +756,7 @@ void emit_puts_one(Compiler *c, int arg, Buf *b, int indent);
 void emit_print_one(Compiler *c, int arg, Buf *b, int indent);
 void emit_p_one(Compiler *c, int arg, Buf *b, int indent);
 int emit_output_call(Compiler *c, int id, Buf *b, int indent);
+int emit_output_spilled(Compiler *c, const char *name, int argc, const int *argv, Buf *b, int indent);
 void emit_assign(Compiler *c, int id, Buf *b, int indent);
 void emit_op_assign(Compiler *c, int id, Buf *b, int indent);
 void emit_cond(Compiler *c, int id, Buf *b);

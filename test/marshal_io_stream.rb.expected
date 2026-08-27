@@ -1,0 +1,8 @@
+true
+{"a" => [1, 2.5, nil, true]}
+{"a" => [1, 2.5, nil, true]}
+true
+true
+true
+[1, "two", :three]
+"x"

@@ -583,6 +583,53 @@ void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   }
 }
 
+/* Ruby evaluates every puts / print / p argument before writing any. The
+   per-argument emitters interleave evaluation and output, which is only
+   observable when a later argument has side effects; then box all arguments
+   first and print the array. Returns 0 when the per-argument path is fine. */
+int emit_output_spilled(Compiler *c, const char *name, int argc, const int *argv, Buf *b, int indent) {
+  if (argc < 2) return 0;
+  int effectful = 0;
+  for (int k = 1; k < argc && !effectful; k++) {
+    int a = argv[k];
+    if (nt_type(c->nt, a) && sp_streq(nt_type(c->nt, a), "SplatNode")) a = nt_ref(c->nt, a, "expression");
+    if (a >= 0 && subtree_has_side_effect(c, a)) effectful = 1;
+  }
+  if (!effectful) return 0;
+  int t = ++g_tmp;
+  emit_indent(b, indent);
+  buf_printf(b, "{ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);\n", t, t);
+  for (int k = 0; k < argc; k++) {
+    int a = argv[k];
+    /* an argument's hoisted prelude (`st.add(2).size`) must run right before
+       its own push, not before the whole array build */
+    Buf apre, abody; memset(&apre, 0, sizeof apre); memset(&abody, 0, sizeof abody);
+    Buf *sv_pre = g_pre; int sv_ind = g_indent;
+    g_pre = &apre; g_indent = indent + 2;
+    if (nt_type(c->nt, a) && sp_streq(nt_type(c->nt, a), "SplatNode")) {
+      int sx = nt_ref(c->nt, a, "expression");
+      buf_printf(&abody, "sp_PolyArray_concat_into(_t%d, ", t);
+      if (sx >= 0) emit_boxed(c, sx, &abody); else buf_puts(&abody, "sp_box_nil()");
+      buf_puts(&abody, ");\n");
+    }
+    else {
+      buf_printf(&abody, "sp_PolyArray_push(_t%d, ", t); emit_boxed(c, a, &abody); buf_puts(&abody, ");\n");
+    }
+    g_pre = sv_pre; g_indent = sv_ind;
+    if (apre.p) buf_puts(b, apre.p);
+    emit_indent(b, indent + 2);
+    if (abody.p) buf_puts(b, abody.p);
+    free(apre.p); free(abody.p);
+  }
+  emit_indent(b, indent + 2);
+  if (sp_streq(name, "puts"))       buf_printf(b, "sp_puts_elems(sp_box_poly_array(_t%d));\n", t);
+  else if (sp_streq(name, "print")) buf_printf(b, "sp_splat_print(sp_box_poly_array(_t%d));\n", t);
+  else buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
+                     "fputs(sp_poly_inspect(_t%d->data[_i%d]), stdout); putchar('\\n'); }\n", t, t, t, t, t, t);
+  emit_indent(b, indent); buf_puts(b, "}\n");
+  return 1;
+}
+
 int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -597,6 +644,9 @@ int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   const int *argv = NULL;
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
 
+  if (sp_streq(name, "puts") || sp_streq(name, "print") || sp_streq(name, "p") || sp_streq(name, "pp")) {
+    if (emit_output_spilled(c, name, argc, argv, b, indent)) return 1;
+  }
   if (sp_streq(name, "puts")) {
     if (argc == 0) { emit_indent(b, indent); buf_puts(b, "putchar('\\n');\n"); return 1; }
     for (int k = 0; k < argc; k++) emit_puts_one(c, argv[k], b, indent);
@@ -1461,8 +1511,19 @@ int static_isa_cond(Compiler *c, int pred) {
   int args = nt_ref(nt, pred, "arguments");
   int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
   if (ac != 1 || !av || !nt_type(nt, av[0]) || !sp_streq(nt_type(nt, av[0]), "ConstantReadNode")) return -1;
-  const char *tname = nt_str(nt, av[0], "name");
-  int target = comp_class_index(c, tname);
+  const char *target_name = nt_str(nt, av[0], "name");
+  if (!target_name) return -1;
+  /* A scalar local against a builtin class is answered from its type. Not a
+     bool (TrueClass/FalseClass depends on the value), not a Queue (shares its
+     runtime object with SizedQueue), and only a local read so no receiver
+     evaluation is dropped. */
+  if (!ty_is_object(rt) && rt != TY_BOOL && rt != TY_QUEUE && rt != TY_UNKNOWN &&
+      (is_builtin_class_name(target_name) || is_builtin_module_name(target_name))) {
+    const char *rnt = nt_type(nt, recv);
+    if (!rnt || !sp_streq(rnt, "LocalVariableReadNode")) return -1;
+    return ty_matches_class(rt, target_name, sp_streq(nm, "instance_of?"));
+  }
+  int target = comp_class_index(c, target_name);
   if (target < 0) return -1;
   /* A number/symbol/bool is never an instance of a user class, so the arm that
      reads it as one is dead -- and it is the only place a call like
@@ -1473,7 +1534,7 @@ int static_isa_cond(Compiler *c, int pred) {
   if (!ty_is_object(rt) && !ty_is_array(rt) && !ty_is_hash(rt) &&
       (rt == TY_INT || rt == TY_BIGINT || rt == TY_FLOAT || rt == TY_BOOL ||
        rt == TY_SYMBOL || rt == TY_STRING) &&
-      tname && !is_builtin_class_name(tname)) {
+      target_name && !is_builtin_class_name(target_name)) {
     for (int k = 0; k < c->nclasses; k++) {
       if (!c->classes[k].name || !is_builtin_class_name(c->classes[k].name)) continue;
       for (int m = 0; m < c->classes[k].nincluded_mods; m++)
@@ -1488,12 +1549,32 @@ int static_isa_cond(Compiler *c, int pred) {
   return 0;
 }
 
+/* A writer the compiler SYNTHESIZES -- attr_writer / attr_accessor, a Struct
+   member, or one reached through a superclass or an included module -- has no
+   body in the AST, so `obj.foo = v` is a CallNode that the write scan below
+   cannot see. Its only visible write is then whatever the constructor assigns,
+   and a nil there reads as "never true" while the real value arrives through
+   the setter (#4107). A hand-written `def foo=(v); @foo = v; end` is not
+   affected: its body holds a real write node the scan already counts. */
+static int ivar_has_generated_writer(Compiler *c, const char *nm) {
+  const char *base = nm + 1;            /* "@foo" -> "foo" */
+  for (int k = 0; k < c->nclasses; k++) {
+    const ClassInfo *ci = &c->classes[k];
+    for (int w = 0; w < ci->nwriters; w++)
+      if (ci->writers[w] && sp_streq(ci->writers[w], base)) return 1;
+    for (int w = 0; w < ci->nsg_writers; w++)
+      if (ci->sg_writers[w] && sp_streq(ci->sg_writers[w], base)) return 1;
+  }
+  return 0;
+}
+
 /* Scan every program-wide write to ivar `nm` ("@foo"): returns 0 when at least
    one write exists and all of them assign nil (statically falsy), -1 otherwise
    (no writes seen, a non-nil write, or an opaque write form). */
 static int ivar_all_writes_nil(Compiler *c, const char *nm) {
   const NodeTable *nt = c->nt;
   if (!nm) return -1;
+  if (ivar_has_generated_writer(c, nm)) return -1;
   int saw_write = 0;
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
@@ -1512,6 +1593,21 @@ static int ivar_all_writes_nil(Compiler *c, const char *nm) {
              sp_streq(ty, "InstanceVariableTargetNode")) {
       const char *wn = nt_str(nt, id, "name");
       if (wn && sp_streq(wn, nm)) return -1;  /* other write forms: unknown */
+    }
+    else if (sp_streq(ty, "CallNode")) {
+      /* instance_variable_set writes an ivar the scan cannot attribute
+         syntactically. A literal symbol names its target, so only a matching
+         one disqualifies; a computed name could be any ivar. */
+      const char *cn = nt_str(nt, id, "name");
+      if (!cn || !sp_streq(cn, "instance_variable_set")) continue;
+      int args = nt_ref(nt, id, "arguments");
+      int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+      if (ac < 1 || !av) return -1;
+      const char *aty = nt_type(nt, av[0]);
+      if (!aty || !sp_streq(aty, "SymbolNode")) return -1;   /* computed name */
+      const char *sv = nt_str(nt, av[0], "value");
+      if (!sv) return -1;
+      if (sp_streq(sv, nm) || (sv[0] != '@' && sp_streq(sv, nm + 1))) return -1;
     }
   }
   return saw_write ? 0 : -1;
@@ -2502,7 +2598,8 @@ static void emit_pm_typed_assign(Scope *sc, const char *lnm,
   else if (ty == TY_INT_ARRAY)            buf_printf(b, "(sp_IntArray *)(%s).v.p", boxed);
   else if (ty == TY_FLOAT_ARRAY)          buf_printf(b, "(sp_FloatArray *)(%s).v.p", boxed);
   else if (ty == TY_STR_ARRAY)            buf_printf(b, "(sp_StrArray *)(%s).v.p", boxed);
-  else if (ty == TY_POLY_ARRAY)           buf_printf(b, "(sp_PolyArray *)(%s).v.p", boxed);
+  /* the slice keeps the scrutinee's kind, which may be a typed array */
+  else if (ty == TY_POLY_ARRAY)           buf_printf(b, "sp_poly_to_a_arr(%s)", boxed);
   else if (ty == TY_STRING)               buf_printf(b, "(%s).v.s", boxed);
   else                                    buf_puts(b, boxed);  /* poly: direct */
   buf_puts(b, ";\n");
@@ -5097,10 +5194,10 @@ void emit_return(Compiler *c, int id, Buf *b, int indent) {
       }
     }
     {
+      /* inside a rescue/else clause the region's frame is already popped, so
+         0 is a valid count; popping one anyway takes a caller's handler */
       int pops = g_exc_frame_depth - ctx->exc_base;
-      if (pops < 1) pops = 1;   /* at least the ensure frame itself */
-      /* pop the handlers for rescue bodies inside this ensure region we are
-         leaving; rescues outside it are popped at the ensure re-dispatch. */
+      if (pops < 0) pops = 0;
       emit_cur_exc_restore(b, ctx->exc_base);
       buf_printf(b, "_retf%d = 1; sp_exc_top -= %d; goto _ensure%d; }\n",
                  ctx->lid, pops, ctx->lid);
@@ -5943,6 +6040,38 @@ static int emit_nullable_int_ternary(Compiler *c, int v, Buf *b) {
    definition wins, with a same-class tie going to the method, exactly as the
    statically typed emitter arbitrates. `objp` is a C expression for the
    receiver as a raw pointer, `src` the value temp, `at` its type. */
+/* An empty `[]` / `{}` has no elements to type it, so inference gives the
+   literal node whatever the reads elsewhere suggest -- which is not the slot it
+   is about to be stored into. The write is the one place that knows the slot,
+   so it lends the literal that variant. Without it the fresh container has one
+   layout and every later read of the slot has another: a module's
+   `@reg ||= {}` built an sp_StrPolyHash for a slot the poly-keyed writes had
+   already made sp_PolyPolyHash, and the C stopped on the pointer types
+   (#4111). Returns 1 when it emitted the literal. */
+static int emit_empty_literal_as(Compiler *c, int v, TyKind slot, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *vty = v >= 0 ? nt_type(nt, v) : NULL;
+  if (!vty) return 0;
+  int n = 0;
+  if (sp_streq(vty, "ArrayNode")) {
+    nt_arr(nt, v, "elements", &n);
+    if (n) return 0;
+    if (ty_is_ptr_array(slot))   { buf_puts(b, "sp_PtrArray_new()");  return 1; }
+    if (slot == TY_POLY_ARRAY)   { buf_puts(b, "sp_PolyArray_new()"); return 1; }
+    if (array_kind(slot)) { buf_printf(b, "sp_%sArray_new()", array_kind(slot)); return 1; }
+    return 0;
+  }
+  if (sp_streq(vty, "HashNode") || sp_streq(vty, "KeywordHashNode")) {
+    nt_arr(nt, v, "elements", &n);
+    if (n || !ty_is_hash(slot)) return 0;
+    const char *hcn = ty_hash_cname(slot);
+    if (!hcn) return 0;
+    buf_printf(b, "sp_%sHash_new()", hcn);
+    return 1;
+  }
+  return 0;
+}
+
 static void emit_boxed_writer_arms(Compiler *c, const char *base, const char *nm,
                                    const char *objp, const char *src, TyKind at, Buf *b) {
   for (int k = 0; k < c->nclasses; k++) {
@@ -6584,7 +6713,8 @@ else {
       emit_indent(b, indent);
       if (is_or) buf_printf(b, "if (!%s) %s = ", ref2, ref2);
       else       buf_printf(b, "if (%s) %s = ", ref2, ref2);
-      emit_expr(c, v, b); buf_puts(b, ";\n");
+      if (!emit_empty_literal_as(c, v, ivt2, b)) emit_expr(c, v, b);
+      buf_puts(b, ";\n");
     }
     else if (!is_or) {
       emit_indent(b, indent);
@@ -6724,12 +6854,8 @@ else {
       else if (ivt == TY_STRING) buf_puts(b, "NULL");
       else buf_puts(b, default_value(ivt));
     }
-    else if (v_empty_array && ivt == TY_POLY_ARRAY) buf_puts(b, "sp_PolyArray_new()");
-    else if (v_empty_array && array_kind(ivt)) buf_printf(b, "sp_%sArray_new()", array_kind(ivt));
-    else if (v_empty_hash && ty_is_hash(ivt)) {
-      const char *hcn = ty_hash_cname(ivt);
-      if (hcn) buf_printf(b, "sp_%sHash_new()", hcn);
-      else emit_expr(c, v, b);
+    else if ((v_empty_array || v_empty_hash) && emit_empty_literal_as(c, v, ivt, b)) {
+      /* the literal took the slot's variant */
     }
     else if (ivt == TY_STRBUF) {
       /* shared handle slot: an alias RHS (a shared local/ivar read) copies
@@ -8640,6 +8766,7 @@ else {
           buf_printf(b, "sp_%sHash_set(", hn);
           emit_expr(c, recv_id, b); buf_puts(b, ", ");
           if (ty_hash_key(recv_t) == TY_INT) emit_int_expr(c, idx_argv[0], b);
+          else if (ty_hash_key(recv_t) == TY_POLY) emit_boxed(c, idx_argv[0], b);
           else emit_expr(c, idx_argv[0], b);
           buf_puts(b, ", ");
           if (recv_t == TY_SYM_POLY_HASH || recv_t == TY_STR_POLY_HASH || recv_t == TY_POLY_POLY_HASH) {
@@ -9072,7 +9199,7 @@ else {
     if (g_ensure_depth > g_loop_ensure_base) {
       EnsureCtx *nctx = &g_ensure_stack[g_ensure_depth - 1];
       int npops = g_exc_frame_depth - nctx->exc_base;
-      if (npops < 1) npops = 1;
+      if (npops < 0) npops = 0;   /* see emit_return */
       emit_indent(b, indent);
       buf_puts(b, "{ ");
       emit_cur_exc_restore(b, nctx->exc_base);

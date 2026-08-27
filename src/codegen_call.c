@@ -471,7 +471,8 @@ static TyKind ie_splice_value_ty(Compiler *c, int node) {
   if (sp_streq(ty, "BreakNode") || sp_streq(ty, "NextNode")) {
     int a = nt_ref(nt, node, "arguments"); int an = 0;
     const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
-    return an > 0 ? comp_ntype(c, av[0]) : TY_UNKNOWN;
+    if (an > 0) return comp_ntype(c, av[0]);
+    return sp_streq(ty, "NextNode") ? TY_NIL : TY_UNKNOWN;   /* keep in step with ie_block_break_next_ty */
   }
   if (sp_streq(ty, "WhileNode") || sp_streq(ty, "UntilNode") || sp_streq(ty, "ForNode") ||
       sp_streq(ty, "BlockNode") || sp_streq(ty, "LambdaNode") || sp_streq(ty, "DefNode") ||
@@ -3781,6 +3782,123 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
                tv, tv, tf, tv, name, tv);
     return 1;
   }
+  /* The Time methods that answer a Time. The surface had the scalar reads and
+     not these, so a receiver narrowed by is_a?(Time) out of an untyped value
+     answered NoMethodError at run time with nothing wrong in the C (#4109).
+     The zone shift is the same helper the typed emitter calls; only the boxing
+     differs, since the receiver here is a poly. */
+  {
+    /* utc / gmtime / localtime convert the receiver IN PLACE and answer it, the
+       way CRuby does; getutc / getgm / getlocal answer a fresh Time and leave
+       the receiver alone. Writing through the box rather than boxing a copy
+       keeps the object identity, so another reference to the same Time sees
+       the conversion, as it does in Ruby. */
+    const char *tconv = NULL;
+    int mutates = 0;
+    if (argc == 0) {
+      if (sp_streq(name, "utc") || sp_streq(name, "gmtime"))
+        { tconv = "sp_time_utc"; mutates = 1; }
+      else if (sp_streq(name, "getutc") || sp_streq(name, "getgm"))
+        tconv = "sp_time_utc";
+      else if (sp_streq(name, "localtime"))
+        { tconv = "sp_time_localtime"; mutates = 1; }
+      else if (sp_streq(name, "getlocal"))
+        tconv = "sp_time_localtime";
+    }
+    if (tconv) {
+      int tv = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+      buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME ? ", tv, tv);
+      if (mutates)
+        buf_printf(b, "(*(sp_Time *)_t%d.v.p = %s(*(sp_Time *)_t%d.v.p), _t%d)",
+                   tv, tconv, tv, tv);
+      else
+        buf_printf(b, "sp_box_time(%s(*(sp_Time *)_t%d.v.p))", tconv, tv);
+      buf_printf(b, " : (sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), sp_box_nil()); })",
+                 name, tv);
+      return 1;
+    }
+    /* localtime(off) / getlocal(off): a fixed offset, seconds or "+HH:MM". */
+    if (argc == 1 && (sp_streq(name, "localtime") || sp_streq(name, "getlocal"))) {
+      int tv = ++g_tmp, ov = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+      buf_printf(b, "; sp_int _t%d = ", ov);
+      if (comp_ntype(c, argv[0]) == TY_STRING) {
+        buf_puts(b, "sp_time_offset_from_str("); emit_str_expr(c, argv[0], b); buf_puts(b, ")");
+      }
+      else emit_int_expr(c, argv[0], b);
+      buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
+                    " ? sp_box_time(sp_time_getlocal_off(*(sp_Time *)_t%d.v.p, _t%d))"
+                    " : (sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), sp_box_nil()); })",
+                 tv, tv, tv, ov, name, tv);
+      return 1;
+    }
+  }
+  /* The rest of the Time surface on a boxed receiver: the typed emitter serves
+     48 names here and this one served 15, so a Time narrowed out of an untyped
+     value answered NoMethodError for the other 33 with a clean C build. The
+     expressions are the typed ones with the receiver unboxed (#4109). */
+  if (argc == 0) {
+    const char *ti = NULL, *tb = NULL, *ts = NULL;
+    /* Only the names Time alone owns: min / round / floor / ceil are the
+       collections' and the numbers' too, and an arm here would answer for
+       every boxed receiver rather than only for a Time. */
+    if      (sp_streq(name, "tv_usec") || sp_streq(name, "usec"))
+      ti = "((sp_int)((sp_Time *)_tR.v.p)->tv_nsec / 1000)";
+    else if (sp_streq(name, "tv_nsec") || sp_streq(name, "nsec"))
+      ti = "((sp_int)((sp_Time *)_tR.v.p)->tv_nsec)";
+    else if (sp_streq(name, "utc_offset") || sp_streq(name, "gmt_offset") ||
+             sp_streq(name, "gmtoff"))
+      ti = "sp_time_utc_offset(*(sp_Time *)_tR.v.p)";
+    else if (sp_streq(name, "utc?") || sp_streq(name, "gmt?"))
+      tb = "(((sp_Time *)_tR.v.p)->is_utc == 1)";
+    else if (sp_streq(name, "dst?") || sp_streq(name, "isdst"))
+      tb = "(sp_time_isdst(*(sp_Time *)_tR.v.p) != 0)";
+    else if (sp_streq(name, "sunday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 0)";
+    else if (sp_streq(name, "monday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 1)";
+    else if (sp_streq(name, "tuesday?"))   tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 2)";
+    else if (sp_streq(name, "wednesday?")) tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 3)";
+    else if (sp_streq(name, "thursday?"))  tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 4)";
+    else if (sp_streq(name, "friday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 5)";
+    else if (sp_streq(name, "saturday?"))  tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 6)";
+    else if (sp_streq(name, "zone"))       ts = "sp_time_zone(*(sp_Time *)_tR.v.p)";
+    else if ((sp_streq(name, "iso8601") || sp_streq(name, "xmlschema")) &&
+             sp_feature_enabled("time"))
+      ts = "sp_time_iso8601(*(sp_Time *)_tR.v.p)";
+    if (ti || tb || ts) {
+      const char *expr = ti ? ti : tb ? tb : ts;
+      const char *cty  = ti ? "sp_int" : tb ? "sp_bool" : "const char *";
+      const char *miss = ti ? "0" : tb ? "FALSE" : "NULL";
+      int tv = ++g_tmp;
+      /* `_tR` in the table above stands for this arm's own temp; splice the
+         real name in rather than threading it through every entry. */
+      Buf body; memset(&body, 0, sizeof body);
+      for (const char *q = expr; *q; ) {
+        const char *hit = strstr(q, "_tR");
+        if (!hit) { buf_puts(&body, q); break; }
+        buf_printf(&body, "%.*s_t%d", (int)(hit - q), q, tv);
+        q = hit + 3;
+      }
+      buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+      buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME ? %s"
+                    " : (%s)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), %s); })",
+                 tv, tv, body.p ? body.p : "0", cty, name, tv, miss);
+      free(body.p);
+      return 1;
+    }
+  }
+  /* Time#subsec: Integer 0 on a whole second, else the exact Rational. */
+  if (argc == 0 && sp_streq(name, "subsec")) {
+    int tv = ++g_tmp;
+    buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+    buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
+                  " ? (((sp_Time *)_t%d.v.p)->tv_nsec == 0 ? sp_box_int(0)"
+                  " : sp_box_rational(sp_rational_new((sp_int)((sp_Time *)_t%d.v.p)->tv_nsec, 1000000000)))"
+                  " : (sp_raise_nomethod(sp_nomethod_msg(\"subsec\", _t%d)), sp_box_nil()); })",
+               tv, tv, tv, tv, tv);
+    return 1;
+  }
+
   /* Proc#arity: read the arity field off the boxed proc. */
   if (sp_streq(name, "arity") && argc == 0) {
     int tv = ++g_tmp;
@@ -6908,7 +7026,12 @@ static int emit_class_new_call(Compiler *c, int id, Buf *b) {
            CRuby for a non-String, non-to_str value). */
         const char *a0ty = argc >= 1 ? nt_type(nt, argv[0]) : NULL;
         int has_content = argc >= 1 && !(a0ty && sp_streq(a0ty, "KeywordHashNode"));
-        if (has_content) { buf_puts(b, "sp_str_dup_external("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
+        /* sp_str_dup, not sp_str_dup_external: the argument is a spinel
+           string, whose length is in its header. _external sizes with strlen,
+           which is right for a C string from getenv and wrong here -- it cut
+           String.new("a\0b") down to one byte while the same literal kept all
+           three, so a copy silently lost data a literal did not. */
+        if (has_content) { buf_puts(b, "sp_str_dup("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
         else buf_puts(b, "sp_str_dup_external((&(\"\\xff\")[1]))");
         return 1;
       }
@@ -15889,6 +16012,31 @@ static void emit_call_body(Compiler *c, int id, Buf *b) {
         }
         free(rb.p); return;
       }
+      if (sp_streq(name, "connect_nonblock") && pos9 == 1) {
+        /* 1-arg form: a packed sockaddr String. Mirror the 2-arg
+           shape: `exception: false` swaps the IO::WaitWritable raise
+           for the :wait_writable symbol so polling loops can stay
+           non-raising. */
+        int ts = ++g_tmp;
+        if (no_exc) {
+          int tn = ++g_tmp;
+          buf_printf(b, "({ const char *_t%d = ", ts);
+          emit_str_expr(c, argv[0], b);
+          buf_printf(b, "; sp_int _n%d = sp_sock_connect_nb_sa(%s, _t%d,", tn, r, ts);
+          buf_printf(b, " (sp_int)sp_str_byte_len(_t%d), 0);", ts);
+          buf_printf(b, " _n%d == SP_INT_NIL", tn);
+          buf_printf(b, " ? sp_box_sym(sp_sym_intern(\"wait_writable\"))");
+          buf_printf(b, " : sp_box_int(_n%d); })", tn);
+        }
+        else {
+          buf_printf(b, "({ const char *_t%d = ", ts);
+          emit_str_expr(c, argv[0], b);
+          buf_printf(b, "; sp_sock_connect_nb_sa(%s, _t%d,"
+                        " (sp_int)sp_str_byte_len(_t%d), 1); })",
+                        r, ts, ts);
+        }
+        free(rb.p); return;
+      }
       if (sp_streq(name, "connect_nonblock") && pos9 == 2) {
         if (no_exc) {
           int tw = ++g_tmp;
@@ -17247,9 +17395,11 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
       nt_ref(nt, id, "block") < 0) {
     buf_puts(b, "({ ");
     if (argc == 0 && sp_streq(name, "puts")) buf_puts(b, "putchar('\n');\n");
-    for (int k = 0; k < argc; k++) {
-      if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
-      else emit_print_one(c, argv[k], b, 0);
+    if (!emit_output_spilled(c, name, argc, argv, b, 0)) {
+      for (int k = 0; k < argc; k++) {
+        if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
+        else emit_print_one(c, argv[k], b, 0);
+      }
     }
     buf_puts(b, " sp_box_nil(); })");
     return;
@@ -20583,9 +20733,29 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
       buf_puts(b, "sp_marshal_dump("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
       return;
     }
+    /* Marshal.dump(obj, io): the bytes go to the stream and the stream comes
+       back. Written binary -- a dump is full of NULs, so the length has to
+       come from the header rather than from strlen. */
+    if (sp_streq(name, "dump") && argc == 2 && comp_ntype(c, argv[1]) == TY_IO) {
+      int t = ++g_tmp;
+      buf_printf(b, "({ sp_File *_t%d = ", t); emit_expr(c, argv[1], b);
+      buf_printf(b, "; sp_File_write_bin(_t%d, sp_marshal_dump(", t);
+      emit_boxed(c, argv[0], b);
+      buf_printf(b, ")); _t%d; })", t);
+      return;
+    }
     if (sp_streq(name, "load") && argc == 1) {
       int t = ++g_tmp;
-      buf_printf(b, "({ const char *_t%d = ", t); emit_str_expr(c, argv[0], b);
+      buf_printf(b, "({ const char *_t%d = ", t);
+      /* Marshal.load takes either the bytes or an IO to read them from. The
+         stream form used to reach emit_str_expr, which handed the sp_File*
+         over as though the handle itself were the bytes (#4112). */
+      if (comp_ntype(c, argv[0]) == TY_IO) {
+        buf_puts(b, "sp_File_read("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+      }
+else {
+        emit_str_expr(c, argv[0], b);
+      }
       buf_printf(b, "; sp_marshal_load(_t%d, (sp_int)sp_str_byte_len(_t%d)); })", t, t);
       return;
     }

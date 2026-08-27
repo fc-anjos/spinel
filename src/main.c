@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 
 extern int g_no_root_elision;
+extern int g_require_gate_cli;
 extern int g_inline_hot;
 extern int g_no_write_barrier;
 #define PATH_SEP '/'
@@ -213,6 +214,7 @@ static void usage(void) {
     "  --version   Print the compiler build revision\n"
     "  -c          C source only (don't compile)\n"
     "  -I DIR      Add a feature search root for `require \"name\"` (like ruby -I)\n"
+    "  --require-gate  Refuse an unresolvable require instead of warning\n"
     "  --emit-rbs  Dump inferred type signatures as RBS (-> app.rbs), no binary\n"
     "  --emit-types Dump per-position inferred types + diagnostics as JSON\n"
     "  --emit-symbol-map  Dump emitted-symbol -> Ruby-name map as JSON, no binary\n"
@@ -286,6 +288,12 @@ int main(int argc, char **argv) {
        and a faster C compile, at the cost of a call per hot-loop method. */
     else if (sp_streq(a, "--no-inline-hot")) { g_inline_hot = 0; i++; }
     else if (sp_streq(a, "--no-write-barrier")) { g_no_write_barrier = 1; i++; }
+    /* Refuse an unresolvable require instead of warning past it. Inside a
+       resolved dependency set the universe is known, so a require that
+       resolves to nothing is a bug; `spin build` has always compiled this way
+       through SPINEL_REQUIRE_GATE, and `spin flags` needs to hand the same
+       gate to a caller driving the compiler itself (#4105). */
+    else if (sp_streq(a, "--require-gate")) { g_require_gate_cli = 1; i++; }
     else if (sp_streq(a, "-c"))            { c_only = 1; i++; }
     else if (sp_streq(a, "-I"))            { if (++i < argc) sp_add_feature_root(argv[i]); i++; }
     else if (!strncmp(a, "-I", 2) && a[2]) { sp_add_feature_root(a + 2); i++; }

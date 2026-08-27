@@ -1,0 +1,12 @@
+"8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+"c22b5f9178342609428d6f51b2c5af4c0bde6a42"
+"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+32
+20
+"2d93cbc1be167bcb1637a4a23cbff01a7878f0c50ee833954ea5221bb1b8c628"
+"2d93cbc1be167bcb1637a4a23cbff01a7878f0c50ee833954ea5221bb1b8c628"
+"102900b72b7bf1031eec76b4804b66052376896b"
+"59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138"
+["OpenSSL::Digest::DigestError", "OpenSSL::OpenSSLError", "StandardError"]
+["OpenSSL::SSL::SSLError", "OpenSSL::OpenSSLError", "StandardError"]
+OpenSSL::Digest::DigestError: unsupported digest algorithm: MD5

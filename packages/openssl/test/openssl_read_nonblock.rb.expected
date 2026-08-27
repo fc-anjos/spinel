@@ -1,0 +1,11 @@
+true
+true
+false
+true
+true
+rescued as IO::WaitReadable: OpenSSL::SSL::SSLErrorWaitReadable
+rescued as IO::WaitWritable: OpenSSL::SSL::SSLErrorWaitWritable
+"cde"
+""
+5
+0

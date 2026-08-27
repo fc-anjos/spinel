@@ -28,14 +28,21 @@ cannot provide is reported when you compile, not when you run.
 ## The require-gate
 
 The require-gate makes require-gated stdlib unavailable unless you `require` it,
-matching CRuby. It is currently **opt-in**: set the environment variable
-`SPINEL_REQUIRE_GATE=1` when compiling. With it off (the default today) the old
-always-available behaviour is preserved. The gate is expected to become the
-default at a future release boundary.
+matching CRuby. It is currently **opt-in**: pass `--require-gate`, or set the
+environment variable `SPINEL_REQUIRE_GATE=1`, when compiling. With it off (the
+default today) the old always-available behaviour is preserved. The gate is
+expected to become the default at a future release boundary.
 
 ```sh
-SPINEL_REQUIRE_GATE=1 spinel myprogram.rb
+spinel --require-gate myprogram.rb
+SPINEL_REQUIRE_GATE=1 spinel myprogram.rb   # the same switch
 ```
+
+`spin build` always compiles with the gate on: inside a resolved dependency set
+the universe is known, so a `require` that resolves to nothing is a bug rather
+than something to warn past. `spin flags` hands the flag to a build driven from
+outside spin, which is why it has a flag spelling at all — an environment
+assignment cannot ride inside a flag string.
 
 ### Require-gated stdlib
 
@@ -112,7 +119,10 @@ A few `require`s name a capability Spinel already provides as core, and are
 Some stdlib ships with Spinel as Ruby source and is spliced when required —
 `set`, `forwardable`, `optparse`, `erb`, `csv`, `pathname`, `digest`, `base64`
 (plus the `stringio`/`strscan`/`json` marker shims for their C-backed
-features). Each lives as an ordinary
+features). `net/http` and `uri` are there, and so
+is `openssl` -- the one that is conditional: it is glue over the system libssl, so it exists only where those
+headers did at build time, and `require "openssl"` is otherwise the
+unsatisfiable require it is for any library Spinel does not carry. Each lives as an ordinary
 spinelgem under `packages/<name>/` beside the compiler (`packages/set/set.rb` with
 its `spin.toml`); `lib/` holds only the C runtime. The `require` pulls in
 the package's file like any other package — pre-installed just means no fetch.
@@ -138,6 +148,23 @@ Pure Ruby needs only the `.rb`: it is spliced into the whole-program compile and
 Spinel infers types from it like your own code, so no manifest or `.rbs` is
 required (an `.rbs` is optional, to pin the public surface). A `require` that no
 root satisfies is the compile error from the previous section.
+
+**A spin package is already in the colocated form.** A package named `curses`
+lives at `<pkgs>/curses/curses.rb`, so `-I <pkgs>` resolves `require "curses"`
+against it — with no project file and no `spin` involved — and one root serves
+every package under it. Its carried C reaches the link line through the
+compiler's repeatable `--link`:
+
+```sh
+spinel -I spin/packages --link ~/.cache/spin/native/curses-0.1.0-cc/sp_curses.o app.rb
+```
+
+The root has to be the directory the package sits *in*. `-I .` at a repository
+root whose packages live under `spin/packages/` looks for `./curses.rb` and
+`./curses/curses.rb`, finds neither, and the `require` is ignored with a
+warning (or refused, under the gate). Working out which roots and which objects
+a dependency set implies is what [`spin flags`](spin.md#building-outside-spin)
+does for you.
 
 ### Planned
 

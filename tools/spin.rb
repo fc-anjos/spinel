@@ -23,6 +23,8 @@ usage: spin <command> [args]
   trust <name>         always allow <name>'s declared native build steps
                        (one run: --allow-native-build / SPIN_ALLOW_NATIVE_BUILD=1)
   clean                remove build/
+  flags                print the compiler flags this project implies, for a
+                       build driven from outside spin (Makefile, script)
   list [--json]        resolved dependency set (name, version, source)
   tree [--json]        dependency tree from this package
   publish [--direct]   validate + test, then submit this release to the index
@@ -45,6 +47,27 @@ def find_root(dir)
     return "" if up == d
     d = up
   end
+end
+
+# `command -v` for one name, without a shell: the PATH entry that would run.
+# mkdir -p for one path, without a shell.
+def mkdir_p_path(path)
+  acc = path.start_with?("/") ? "/" : ""
+  path.split("/").each do |seg|
+    next if seg == ""
+    acc = acc == "/" ? "/" + seg : (acc == "" ? seg : File.join(acc, seg))
+    Dir.mkdir(acc) unless Dir.exist?(acc)
+  end
+  nil
+end
+
+def which(name)
+  ENV["PATH"].to_s.split(":").each do |dir|
+    next if dir == ""
+    cand = File.join(dir, name)
+    return cand if File.file?(cand) && File.executable?(cand)
+  end
+  ""
 end
 
 def spinel_bin
@@ -216,9 +239,27 @@ end
 # installed tree ./lib. $0 does not resolve symlinks, so when spin runs as
 # the /usr/local/bin/spin symlink the sibling is the /usr/local/bin/spinel
 # symlink -- probe the install layout (<prefix>/lib/spinel/lib) from there.
+# Where the runtime headers are: package C includes "spinel/runtime.h", and
+# the compiler ships them beside itself. Resolved from the compiler's own
+# path, which is why a PATH-resolved compiler has to be located rather than
+# given up on -- `spin install` puts spin in ~/.local/bin with no spinel
+# beside it, and returning "" there dropped -I <spinel>/lib from every
+# package-C compile. The package then failed on a missing runtime.h while the
+# same package built fine from a tree where the two sat together (#4115).
+#
+# SPINEL_HDR_DIR overrides the search outright, for a layout this cannot guess.
 def spinel_hdr_dir
+  env = ENV["SPINEL_HDR_DIR"].to_s
+  return env if env != "" && File.exist?(File.join(env, "spinel_rt.h"))
   bin = spinel_bin
-  return "" if bin == "spinel"
+  if bin == "spinel"
+    found = which("spinel")
+    # PATH returns the symlink as-is; the lib probe below then walks
+    # relative to a symlinked path and misses the install tree.
+    found = File.realpath(found) if found != "" && File.symlink?(found)
+    bin = found
+  end
+  return "" if bin == ""
   d = File.expand_path("..", bin)
   a = File.join(d, "lib")
   return a if File.exist?(File.join(a, "spinel_rt.h"))
@@ -230,11 +271,22 @@ def spinel_hdr_dir
   ""
 end
 
-# Newline-packed absolute paths of a package's [[build]] workdirs: sources a
-# declared build step compiles its own way are NOT carried C, so the per-file
-# cc sweep must not touch them (they have no include path and would hard-fail
-# the build before [[build]] ever runs -- the toy tinynn bounce, #1845).
-def native_build_workdirs(dir)
+# Newline-packed absolute paths kept out of the per-file cc sweep and out of
+# the staleness scan that decides whether the cached objects are current.
+#
+# Two sources. A [[build]] workdir is compiled by the package's own build
+# system, so it is not carried C: the sweep must not touch it (no include
+# path, and it would hard-fail before [[build]] ever runs -- the toy tinynn
+# bounce, #1845). And `[package] exclude` is the author saying a path is not
+# part of this build at all. Nothing else can say it: `.rb` enters the build by
+# require-reachability, `.c` enters by presence, so an application whose
+# repository also holds a C program of its own -- a `main()` beside the Ruby --
+# had no way to keep it out (#4105).
+#
+# The globs are expanded here rather than matched at each candidate, so
+# path_excluded? stays an exact compare, and naming a directory prunes its
+# whole subtree (collect_c consults it before it recurses).
+def native_excludes(dir)
   mf = File.join(dir, "spin.toml")
   return "" unless File.exist?(mf)
   toml = TomlDoc.parse(File.read(mf))
@@ -247,6 +299,13 @@ def native_build_workdirs(dir)
       out += File.expand_path(wd, dir)
     end
     i += 1
+  end
+  toml.get_array("package", "exclude").split("\n").each do |g|
+    next if g == ""
+    Dir.glob(File.join(dir, g)).each do |hit|
+      out += "\n" unless out == ""
+      out += hit
+    end
   end
   out
 end
@@ -290,7 +349,24 @@ def newest_native_input(dir, newest, excl)
   newest
 end
 
+# Where a package's compiled objects live. Shared across projects and keyed by
+# (package, version, toolchain), so the same package is not rebuilt for every
+# consumer.
+#
+# SPIN_NATIVE_CACHE relocates it. Two reasons to want that, both from #4115:
+# a build that must not write outside its own tree, and a debugging session
+# where the answer differs depending on whether an object is already there --
+# pointing it at a scratch directory makes every run start from the same
+# state. SPIN_NO_NATIVE_CACHE=1 goes further and rebuilds every time.
 def native_cache_dir(key)
+  override = ENV["SPIN_NATIVE_CACHE"].to_s
+  if override != ""
+    d = File.expand_path(override)
+    mkdir_p_path(d)
+    d = File.join(d, key)
+    Dir.mkdir(d) unless Dir.exist?(d)
+    return d
+  end
   base = ENV["XDG_CACHE_HOME"].to_s
   base = File.join(ENV["HOME"].to_s, ".cache") if base == ""
   Dir.mkdir(base) unless Dir.exist?(base)   # a fresh XDG_CACHE_HOME
@@ -305,7 +381,7 @@ end
 
 # Compile one package's carried C into the cache; returns the object list.
 def native_objs_for(name, dir, version)
-  excl = native_build_workdirs(dir)
+  excl = native_excludes(dir)
   cs = collect_c(dir, excl)
   return [] if cs == ""
   # The cache key names a DIRECTORY, so the compiler part of it has to be
@@ -319,12 +395,15 @@ def native_objs_for(name, dir, version)
   cs.split("\n").each do |c|
     rel = c[dir.length + 1..-1].to_s
     o = File.join(odir, rel.gsub("/", "_")[0..-3] + ".o")
-    if !File.exist?(o) || File.mtime(o).to_i < hnew
+    if !File.exist?(o) || File.mtime(o).to_i < hnew || ENV["SPIN_NO_NATIVE_CACHE"].to_s != ""
       cmd = native_cc + " -O2 -c '#{c}' -I '#{dir}'"
       cmd += " -I '#{hdr}'" if hdr != ""
       cmd += " -o '#{o}'"
       spin_die("native compile failed: " + rel + " (" + name + ")") unless system(cmd)
-      puts "cc #{name}/#{rel}"
+      # stderr, not stdout: `spin flags` prints a flag string on stdout and a
+      # cold cache compiles here first, so progress on stdout would be spliced
+      # into the flags the caller passes to the compiler (#4105).
+      $stderr.puts "cc #{name}/#{rel}"
     end
     objs.push(o)
   end
@@ -904,25 +983,41 @@ end
 
 # The spinel command line that compiles `entry` to `out`. Split out from
 # compile() so `spin test` can collect commands and run them in parallel.
-def compile_cmd(prj, entry, out, extra)
+# Every compiler flag this project implies, with no entry file and no -o: what
+# `spin build` passes, and what `spin flags` prints. One producer for both, so
+# a Makefile driving the compiler itself gets exactly the build spin would have
+# made rather than an approximation of it (#4105).
+#
+# Every path here is absolute -- find_root walks up from Dir.pwd, path
+# dependencies go through File.expand_path, and cache objects are named from
+# the cache root -- which matters for `spin flags`, whose caller's working
+# directory is its own tree, not this project.
+def spin_flags(prj)
   # Inside a spin project the dependency universe is fully known (manifest +
   # lock), so an unresolvable require is a bug, not a maybe: flip the
   # compiler's require gate from warning to hard error. This also makes
   # stdlib features require-gated, i.e. CRuby-style `require "stringio"`
   # before use.
-  cmd = "SPINEL_REQUIRE_GATE=1 #{spinel_bin} #{entry}"
-  prj.dep_paths.each { |d| cmd += " -I #{d}" }
-  cmd += " -I #{prj.root}"
+  f = "--require-gate"
+  prj.dep_paths.each { |d| f += " -I #{d}" }
+  f += " -I #{prj.root}"
   # Feed .rbs sidecars to the compiler's --rbs seed machinery when the project
   # carries any (issue #1788). `.rbs` participates by extension, so a package's
   # type sidecars pin its public surfaces (e.g. a Router#match that would
   # otherwise infer poly) under `spin build`/`test`. --rbs takes one dir and its
   # extractor scans recursively, so the project root covers every sidecar.
   if Dir.glob(File.join(prj.root, "**", "*.rbs")).any?
-    cmd += " --rbs #{prj.root}"
+    f += " --rbs #{prj.root}"
   end
-  prj.native_objs.each { |o| cmd += " --link #{o}" }
-  prj.native_build_libs.split("\n").each { |l| cmd += " --link #{l}" if l != "" }
+  # Reading these compiles any carried C and runs any declared native build
+  # that is not already cached, which is what makes the --link paths real.
+  prj.native_objs.each { |o| f += " --link #{o}" }
+  prj.native_build_libs.split("\n").each { |l| f += " --link #{l}" if l != "" }
+  f
+end
+
+def compile_cmd(prj, entry, out, extra)
+  cmd = "#{spinel_bin} #{entry} #{spin_flags(prj)}"
   cmd += " #{extra}" if extra != ""
   # `spin build --debug` / `-g` (or SPIN_DEBUG=1) forwards the compiler's
   # debug build (#line + -g -O0) so the emitted binary is steppable in
@@ -1567,6 +1662,14 @@ when "lock", "fetch", "vendor"
   lock_from_records(prj) if cmd == "lock"
   puts "fetched " + prj.dep_paths.length.to_s + " package(s)" if cmd == "fetch"
   cmd_vendor(prj) if cmd == "vendor"
+when "flags"
+  # The handoff: spin resolves the dependencies and warms the native cache,
+  # then hands the compiler flags to whoever is driving the build. An
+  # application whose repository spin does not own -- Ruby and C side by side
+  # under one Makefile -- keeps its layout and still consumes packages (#4105).
+  root = find_root(Dir.pwd)
+  spin_die("no spin.toml found") if root == ""
+  puts spin_flags(Project.new(root))
 when "search"
   cmd_search(rest.empty? ? "" : rest[0])
 when "install"

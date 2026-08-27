@@ -2057,3 +2057,146 @@ int desugar_enumerable_via_to_a(Compiler *c) {
   }
   return changed;
 }
+
+/* `def m(a, ...) = callee(a, ...)` with a rest/kwrest callee becomes
+   `def m(a, *, **) = callee(a, *, **)`. The __fwd_N model (#1288) binds the
+   callee's params positionally, which is exact for fixed params and flattens
+   a rest/kwrest. `*` / `**` follow the callee's params; blocks are not
+   forwarded by this form, so any block involvement keeps the __fwd_N model. */
+static int fwd_node_is(const NodeTable *nt, int id, const char *ty) {
+  return id >= 0 && nt_type(nt, id) && sp_streq(nt_type(nt, id), ty);
+}
+/* highest node id under `id`; ids are pre-order, so [id, max] is the subtree */
+static int fwd_subtree_max(const NodeTable *nt, int id) {
+  if (id < 0 || id >= nt->count) return -1;
+  const SpNode *nd = &nt->nodes[id];
+  int mx = id;
+  for (int j = 0; j < nd->nr; j++) { int m = fwd_subtree_max(nt, nd->r[j].ref); if (m > mx) mx = m; }
+  for (int j = 0; j < nd->na; j++)
+    for (int k = 0; k < nd->a[j].n; k++) { int m = fwd_subtree_max(nt, nd->a[j].ids[k]); if (m > mx) mx = m; }
+  return mx;
+}
+static int fwd_subtree_uses_yield_or_block(const NodeTable *nt, int def) {
+  int pn = nt_ref(nt, def, "parameters");
+  if (pn >= 0 && nt_ref(nt, pn, "block") >= 0) return 1;
+  int hi = fwd_subtree_max(nt, def);
+  for (int id = def; id <= hi; id++) {
+    if (fwd_node_is(nt, id, "YieldNode")) return 1;
+    if (fwd_node_is(nt, id, "CallNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm && sp_streq(nm, "block_given?")) return 1;
+    }
+  }
+  return 0;
+}
+/* bit 1 = positional forwarding, bit 2 = keyword forwarding, bit 4 =
+   block/yield; -1 no def, -2 defs disagree. Fixed parameters count too:
+   forwarding to `def f(*a, k: 0)` needs both channels, as does forwarding to
+   `def f(x, **k)`. */
+static int def_shape_by_name(const NodeTable *nt, const char *name) {
+  int shape = -1;
+  for (int id = 0; id < nt->count; id++) {
+    if (!fwd_node_is(nt, id, "DefNode")) continue;
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm || !sp_streq(nm, name)) continue;
+    int pn = nt_ref(nt, id, "parameters");
+    int sh = 0;
+    if (pn >= 0) {
+      int rn = 0; nt_arr(nt, pn, "requireds", &rn);
+      int on = 0; nt_arr(nt, pn, "optionals", &on);
+      int postn = 0; nt_arr(nt, pn, "posts", &postn);
+      int kn = 0; nt_arr(nt, pn, "keywords", &kn);
+      if (rn > 0 || on > 0 || postn > 0) sh |= 1;
+      if (kn > 0) sh |= 2;
+      if (fwd_node_is(nt, nt_ref(nt, pn, "rest"), "RestParameterNode")) sh |= 1;
+      if (fwd_node_is(nt, nt_ref(nt, pn, "keyword_rest"), "KeywordRestParameterNode")) sh |= 2;
+    }
+    if (fwd_subtree_uses_yield_or_block(nt, id)) sh |= 4;
+    if (shape >= 0 && shape != sh) return -2;
+    shape = sh;
+  }
+  return shape;
+}
+static int fwd_new_node_like(NodeTable *nt, int like, const char *ty) {
+  int id = nt_new_node(nt, ty);
+  if (id < 0) return -1;
+  nt_node_set_int(nt, id, "node_line", nt_int(nt, like, "node_line", 0));
+  nt_node_set_int(nt, id, "node_file", nt_int(nt, like, "node_file", 0));
+  nt_node_set_int(nt, id, "node_col", nt_int(nt, like, "node_col", 0));
+  return id;
+}
+static int any_call_passes_block(const NodeTable *nt, const char *name) {
+  for (int id = 0; id < nt->count; id++) {
+    if (!fwd_node_is(nt, id, "CallNode")) continue;
+    const char *nm = nt_str(nt, id, "name");
+    if (nm && sp_streq(nm, name) && nt_ref(nt, id, "block") >= 0) return 1;
+  }
+  return 0;
+}
+int desugar_forwarding_to_rest_callee(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int changed = 0;
+  int n0 = nt->count;
+  for (int def = 0; def < n0; def++) {
+    if (!fwd_node_is(nt, def, "DefNode")) continue;
+    int pn = nt_ref(nt, def, "parameters");
+    if (pn < 0 || !fwd_node_is(nt, nt_ref(nt, pn, "keyword_rest"), "ForwardingParameterNode")) continue;
+    const char *dname = nt_str(nt, def, "name");
+    if (!dname) continue;
+    int hi = fwd_subtree_max(nt, def) + 1;
+    int calls[n0]; int ncalls = 0; int shape = 0; int ok = 1;
+    for (int id = def + 1; id < hi && id < n0; id++) {
+      if (!fwd_node_is(nt, id, "CallNode")) continue;
+      int args = nt_ref(nt, id, "arguments");
+      int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+      if (ac < 1 || !av || !fwd_node_is(nt, av[ac - 1], "ForwardingArgumentsNode")) continue;
+      const char *cn = nt_str(nt, id, "name");
+      int sh = (nt_ref(nt, id, "receiver") < 0 && cn) ? def_shape_by_name(nt, cn) : -1;
+      if (sh < 0 || nt_ref(nt, id, "block") >= 0) { ok = 0; break; }
+      if (ncalls && sh != shape) { ok = 0; break; }
+      shape = sh;
+      calls[ncalls++] = id;
+    }
+    if (!ok || !ncalls || !(shape & 3) || (shape & 4)) continue;
+    if (any_call_passes_block(nt, dname)) continue;
+    int base = nt->count;
+    /* def m(a, ...) -> def m(a, *, **) */
+    if (shape & 1) {
+      int rp = fwd_new_node_like(nt, pn, "RestParameterNode");
+      if (rp < 0) continue;
+      nt_node_set_ref(nt, pn, "rest", rp);
+    }
+    if (shape & 2) {
+      int kp = fwd_new_node_like(nt, pn, "KeywordRestParameterNode");
+      if (kp < 0) continue;
+      nt_node_set_ref(nt, pn, "keyword_rest", kp);
+    } else nt_node_set_ref(nt, pn, "keyword_rest", -1);
+    /* callee(x, ...) -> callee(x, *, **) */
+    for (int k = 0; k < ncalls; k++) {
+      int call = calls[k];
+      int args = nt_ref(nt, call, "arguments");
+      int ac = 0; const int *av = nt_arr(nt, args, "arguments", &ac);
+      int nargs[ac + 1]; int nn = 0;
+      for (int i = 0; i < ac - 1; i++) nargs[nn++] = av[i];
+      if (shape & 1) {
+        int sp = fwd_new_node_like(nt, call, "SplatNode");
+        if (sp < 0) continue;
+        nt_node_set_ref(nt, sp, "expression", -1);
+        nargs[nn++] = sp;
+      }
+      if (shape & 2) {
+        int kh = fwd_new_node_like(nt, call, "KeywordHashNode");
+        int as = fwd_new_node_like(nt, call, "AssocSplatNode");
+        if (kh < 0 || as < 0) continue;
+        nt_node_set_ref(nt, as, "value", -1);
+        nt_node_set_arr(nt, kh, "elements", &as, 1);
+        nargs[nn++] = kh;
+      }
+      nt_node_set_arr(nt, args, "arguments", nargs, nn);
+    }
+    comp_grow_node_arrays(c);
+    for (int j = base; j < nt->count; j++) c->nscope[j] = c->nscope[def];
+    changed = 1;
+  }
+  return changed;
+}

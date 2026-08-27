@@ -31,7 +31,13 @@ t("bare-g")    { Regexp.new("\\g").match("g")[0] }
 t("bare-p")    { Regexp.new("\\p").match("p")[0] }
 t("pL")        { Regexp.new("\\pL").match("pL")[0] }
 
-# inside a character class CRuby reads them as the letter, and so does the
-# class parser here
+# inside a character class CRuby reads \R and \K as the letter, and so does
+# the class parser here
 t("class-R")   { Regexp.new("[\\R]").match("R")[0] }
 t("class-K")   { Regexp.new("[\\K]").match("K")[0] }
+
+# \p/\P differ: CRuby reads a property escape inside a class as a property
+# test there too, not as its literal letters, so the class parser refuses it
+# the same way the bare form is refused rather than matching "p{Alpha}"
+t("class-p")     { Regexp.new("[\\p{Alpha}]") =~ "a" }
+t("class-P-neg") { Regexp.new("[^\\p{Word}\\- \\t]").match("a d_1") }

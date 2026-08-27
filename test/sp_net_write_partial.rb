@@ -52,8 +52,13 @@ puts "accepted some first: #{sent > 0}"
 
 # Draining the far end makes room, and the write resumes -- the caller keeps
 # the remainder and retries, which is the whole point of the contract.
-Net.sp_net_recv_some(afd, 65536)
-Net.sp_net_recv_some(afd, 65536)
+#
+# ONE read, sized by what was actually buffered. How much the loop above got
+# in depends on the platform's socket buffer -- macOS defaults far smaller
+# than Linux -- so a second fixed-size read is a guess, and where the guess is
+# wrong it waits for bytes nobody will send. sp_net_recv_some waits for
+# readability even on a non-blocking fd, so that wait never ends.
+Net.sp_net_recv_some(afd, sent < 65536 ? sent : 65536)
 puts "resumes: #{Net.sp_net_write_partial(cfd, 'more', 4) > 0}"
 
 Net.sp_net_close(afd)

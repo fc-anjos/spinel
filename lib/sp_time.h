@@ -57,6 +57,11 @@ int64_t sp_time_wday(sp_Time t);
 int64_t sp_time_yday(sp_Time t);
 int64_t sp_time_isdst(sp_Time t);
 int64_t sp_time_utc_offset(sp_Time t);
+/* Time#floor / #ceil / #round: `ndigits` decimal places of the subsecond part,
+   with mode 0 = floor, 1 = ceil, 2 = round-half-up. ndigits 0 is the no-argument
+   form (whole seconds) and >= 9 keeps the full nanosecond resolution; a carry
+   past a second bumps tv_sec. A negative ndigits is CRuby's ArgumentError. */
+sp_Time sp_time_round_to(sp_Time t, int64_t ndigits, int mode);
 
 /* Time + Numeric / Time - Numeric. secs may be fractional. */
 sp_Time sp_time_add(sp_Time t, double secs);

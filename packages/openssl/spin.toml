@@ -1,0 +1,12 @@
+[package]
+name = "openssl"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# Glue over the system libssl (sp_openssl.c) plus the CRuby-shaped namespace
+# in openssl.rb. Spinel implements no TLS itself and bundles no trust
+# anchors: the chain is validated against the operating system's store, so
+# the CVE clock and the CA list belong to the distribution.
+#
+# -lssl / -lcrypto reach the link line only through this file's `ffi_lib`,
+# which is parsed only when `require "openssl"` splices it. A program that
+# does not require openssl links exactly what it did before.

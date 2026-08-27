@@ -78,7 +78,16 @@ void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b) {
                  expr, ty_object_class(t));
     return;
   }
-  if (ty_is_hash(t) && hash_box_cls(t)) { buf_printf(b, "sp_box_obj(%s, %s)", expr, hash_box_cls(t)); return; }
+  /* A hash slot is a nilable C pointer for the same reason the object arm
+     above is: an omitted optional parameter, or any slot that can hold nil,
+     arrives as NULL. sp_box_obj wrapped that NULL in a truthy SP_TAG_OBJ, so
+     `initheader.nil?` answered false and the first read of it dereferenced
+     NULL. Reduced from a Net::HTTP::Post whose second parameter one call site
+     omitted and another passed a Hash to (#4134). */
+  if (ty_is_hash(t) && hash_box_cls(t)) {
+    buf_printf(b, "sp_box_nullable_obj((void *)(%s), %s)", expr, hash_box_cls(t));
+    return;
+  }
   /* a shared-mutable string HANDLE (#3227 phase 3) */
   if (t == TY_STRBUF) { buf_printf(b, "sp_box_obj(%s, SP_BUILTIN_STRBUF)", expr); return; }
   /* An sp_int slot can hold the nil sentinel a nullable read left behind
@@ -894,8 +903,17 @@ void emit_boxed(Compiler *c, int node, Buf *b) {
     return;
   }
   if (ty_is_hash(t)) {
+    /* Nullable, for the same reason the object arm just above is: a hash slot
+       holding nil is a NULL pointer, and sp_box_obj wrapped that in a truthy
+       SP_TAG_OBJ -- so `h.nil?` answered false and the first read of it
+       dereferenced NULL (#4134). Kept in step with emit_boxed_text. */
     const char *hid = hash_box_cls(t);
-    if (hid) { buf_printf(b, "sp_box_obj("); emit_expr(c, node, b); buf_printf(b, ", %s)", hid); return; }
+    if (hid) {
+      buf_puts(b, "sp_box_nullable_obj((void *)(");
+      emit_expr(c, node, b);
+      buf_printf(b, "), %s)", hid);
+      return;
+    }
     unsupported(c, node, "boxing value into poly"); return;
   }
   /* regex values can appear in poly context (multi-typed local); evaluate for
@@ -1481,7 +1499,7 @@ void emit_method_cname(Compiler *c, Scope *s, Buf *b) {
   else if (s->class_id >= 0)
     buf_printf(b, "sp_%s_%s", c->classes[s->class_id].c_name, mc(s->name));
   else
-    buf_printf(b, "sp_%s", mc_top(s->name));
+    buf_printf(b, "sp_%s", mc_top(c, s->name));
 }
 
 /* A poly each-receiver can be a user object at runtime (e.g. a Set operand
@@ -6877,6 +6895,32 @@ static int class_coerce_emittable(Compiler *c, int k) {
   return 1;
 }
 
+/* Generate sp_user_to_io_dispatch: the cls_id switch behind IO.select's
+   #to_io protocol. CRuby waits on anything that answers #to_io, which is how a
+   wrapper holding a socket -- a TLS socket, a protocol object -- gets waited
+   on; the runtime cannot dispatch a user method itself, so it calls this
+   through sp_user_to_io_hook. A class whose #to_io does not answer an IO is
+   left out rather than emitted wrong: it falls through to the TypeError the
+   element would have raised anyway. */
+static void emit_user_to_io_dispatch(Compiler *c, Buf *b) {
+  buf_puts(b, "static sp_File *sp_user_to_io_dispatch(sp_RbVal v) {\n");
+  buf_puts(b, "  switch (v.cls_id) {\n");
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!c->classes[k].instantiated) continue;
+    int defcls = -1;
+    int mi = comp_method_in_chain(c, k, "to_io", &defcls);
+    if (mi < 0 || defcls < 0) continue;
+    Scope *m = &c->scopes[mi];
+    if (!m->reachable || m->nparams != 0 || m->ret != TY_IO) continue;
+    if (scope_is_shadowed(c, mi) || m->is_transplanted_source) continue;
+    const char *dcn = c->classes[defcls].c_name;
+    buf_printf(b, "    case %d: return sp_%s_to_io(%s(sp_%s *)v.v.p);\n",
+               comp_class_index(c, c->classes[k].name),
+               dcn, c->classes[defcls].is_value_type ? "*" : "", dcn);
+  }
+  buf_puts(b, "    default: break;\n  }\n  return NULL;\n}\n");
+}
+
 /* Generate sp_user_coerce_dispatch: a cls_id switch that runs the numeric
    coerce protocol from the ARGUMENT side. `5 + obj` is CRuby's
    `a, b = obj.coerce(5); a <op> b`; the static path already emits that
@@ -7112,6 +7156,8 @@ void emit_regex_section(Compiler *c, Buf *b) {
     buf_puts(b, "static sp_RbVal sp_user_binop_dispatch(const char *op, sp_RbVal a, sp_RbVal b, sp_bool *handled);\n");
   if (g_has_user_coerce)
     buf_puts(b, "static sp_RbVal sp_user_coerce_dispatch(const char *op, sp_RbVal recv, sp_RbVal obj, sp_bool *handled);\n");
+  if (g_has_user_to_io)
+    buf_puts(b, "static sp_File *sp_user_to_io_dispatch(sp_RbVal v);\n");
   if (g_needs_class_machinery)
     buf_puts(b, "static int sp_poly_is_a(sp_RbVal obj, sp_Class klass);\n");
   if (g_gen_obj_hash)
@@ -7171,6 +7217,8 @@ void emit_regex_section(Compiler *c, Buf *b) {
     buf_puts(b, "  sp_user_binop_hook = sp_user_binop_dispatch;\n");
   if (g_has_user_coerce)
     buf_puts(b, "  sp_user_coerce_hook = sp_user_coerce_dispatch;\n");
+  if (g_has_user_to_io)
+    buf_puts(b, "  sp_user_to_io_hook = sp_user_to_io_dispatch;\n");
   if (g_gen_obj_hashkey)
     buf_puts(b, "  sp_obj_hash_hook = sp_gen_obj_hash;\n  sp_obj_eql_hook = sp_gen_obj_eql;\n");
   if (g_gen_obj_valeq)
@@ -8760,7 +8808,8 @@ char *codegen_program(const NodeTable *nt) {
     if (any) {
       for (int i = 0; i < c->nclasses; i++) {
         if (!class_is_exc_subclass(c, i)) continue;
-        if (c->classes[i].nincluded_mods == 0) continue;
+        if (c->classes[i].nincluded_mods == 0 &&
+            c->classes[i].nincluded_mod_names == 0) continue;
         const char *cn0 = class_ruby_name(c, i);
         if (!cn0) cn0 = c->classes[i].name;
         if (!cn0) continue;
@@ -8773,6 +8822,10 @@ char *codegen_program(const NodeTable *nt) {
           if (!mn) mn = c->classes[mi].name;
           if (mn) buf_printf(&b, "\"%s\", ", mn);
         }
+        /* Builtin modules named by path carry no class index; their qualified
+           string is what the match compares. */
+        for (int m = 0; m < c->classes[i].nincluded_mod_names; m++)
+          buf_printf(&b, "\"%s\", ", c->classes[i].included_mod_names[m]);
         buf_puts(&b, "0 };\n");
         buf_printf(&b, "    if(!strcmp(cls,\"%s\"))return _m%d;\n", cn, i);
         if (c->classes[i].name && !sp_streq(cn, c->classes[i].name))
@@ -9145,6 +9198,15 @@ char *codegen_program(const NodeTable *nt) {
     if (!c->classes[k].instantiated) continue;
     if (class_coerce_emittable(c, k)) { g_has_user_coerce = 1; break; }
   }
+  g_has_user_to_io = 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!c->classes[k].instantiated) continue;
+    int dc = -1, mi2 = comp_method_in_chain(c, k, "to_io", &dc);
+    if (mi2 < 0 || dc < 0) continue;
+    Scope *m2 = &c->scopes[mi2];
+    if (m2->reachable && m2->nparams == 0 && m2->ret == TY_IO &&
+        !scope_is_shadowed(c, mi2) && !m2->is_transplanted_source) { g_has_user_to_io = 1; break; }
+  }
   g_gen_obj_hashkey = 0;
   for (int k = 0; k < c->nclasses; k++)
     if (class_is_hashkey(c, k) || class_is_valuekey(c, k)) { g_gen_obj_hashkey = 1; break; }
@@ -9190,6 +9252,7 @@ char *codegen_program(const NodeTable *nt) {
   if (g_has_user_cmp) emit_obj_cmp_dispatch(c, body);
   if (g_has_user_binop) emit_user_binop_dispatch(c, body);
   if (g_has_user_coerce) emit_user_coerce_dispatch(c, body);
+  if (g_has_user_to_io) emit_user_to_io_dispatch(c, body);
   /* Struct/Data value-== hook (after the class struct definitions); emitted
      before the hash-key dispatch, which references sp_obj_eq_dispatch. */
   if (g_gen_obj_valeq) emit_obj_valeq_dispatch(c, body);

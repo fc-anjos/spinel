@@ -1728,6 +1728,46 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        /* tv_sec is the epoch second, the same read #to_i answers (#3866) */
        sp_streq(name, "tv_sec")))
     { *out = TY_INT; return 1; }
+  /* The Time methods that answer a TIME rather than a number, on the same
+     boxed receiver. Only the scalar half of the surface was here, so
+     `value.utc` on a value narrowed by is_a?(Time) typed as nothing and the
+     chained read raised NoMethodError at run time with a clean C build
+     (#4109). The result stays boxed, so a further `.year` dispatches through
+     this same surface. */
+  if (recv >= 0 && rt == TY_POLY && nt_ref(nt, id, "block") < 0 &&
+      !an_user_defines_method(c, name) &&
+      ((argc == 0 && (sp_streq(name, "utc") || sp_streq(name, "gmtime") ||
+                      sp_streq(name, "getutc") || sp_streq(name, "localtime") ||
+                      sp_streq(name, "getlocal") || sp_streq(name, "round"))) ||
+       (argc == 1 && (sp_streq(name, "localtime") || sp_streq(name, "getlocal"))) ||
+       (argc == 0 && sp_streq(name, "getgm"))))
+    { *out = TY_POLY; return 1; }
+  /* The rest of the Time surface on a boxed receiver, typed the way the typed
+     emitter answers them: the scalar reads, the predicates, and the string
+     formatters were all absent, so each was a run-time NoMethodError with a
+     clean C build (#4109). subsec answers Integer 0 or a Rational, so it stays
+     boxed. Only the names Time alone owns are here -- min / round / floor /
+     ceil belong to the collections and the numbers too, and claiming a type
+     for them would answer for every boxed receiver, not just a Time. */
+  if (recv >= 0 && rt == TY_POLY && argc == 0 && nt_ref(nt, id, "block") < 0 &&
+      !an_user_defines_method(c, name)) {
+    if (sp_streq(name, "tv_usec") || sp_streq(name, "usec") ||
+        sp_streq(name, "tv_nsec") || sp_streq(name, "nsec") ||
+        sp_streq(name, "utc_offset") || sp_streq(name, "gmt_offset") ||
+        sp_streq(name, "gmtoff"))
+      { *out = TY_INT; return 1; }
+    if (sp_streq(name, "utc?") || sp_streq(name, "gmt?") || sp_streq(name, "dst?") ||
+        sp_streq(name, "isdst") || sp_streq(name, "sunday?") || sp_streq(name, "monday?") ||
+        sp_streq(name, "tuesday?") || sp_streq(name, "wednesday?") ||
+        sp_streq(name, "thursday?") || sp_streq(name, "friday?") ||
+        sp_streq(name, "saturday?"))
+      { *out = TY_BOOL; return 1; }
+    if (sp_streq(name, "zone") ||
+        ((sp_streq(name, "iso8601") || sp_streq(name, "xmlschema")) &&
+         sp_feature_enabled("time")))
+      { *out = TY_STRING; return 1; }
+    if (sp_streq(name, "subsec")) { *out = TY_POLY; return 1; }
+  }
   /* Range#to_a on a poly value: its element array. */
   if (recv >= 0 && rt == TY_POLY && argc == 0 && nt_ref(nt, id, "block") < 0 &&
       !an_user_defines_method(c, name) && sp_streq(name, "to_a"))

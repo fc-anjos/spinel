@@ -1,0 +1,77 @@
+[]
+""
+[]
+[]
+[]
+Enumerator
+Enumerator
+nil
+1
+0
+nil
+nil
+{}
+{}
+[nil]
+nil
+[]
+0
+[]
+Enumerator
+nil
+[1, 2]
+[1.5]
+["x", "y"]
+[1, 2]
+[1, 2]
+[]
+[1, 2]
+false
+1
+[1, 2]
+[1, 2]
+false
+false
+nil
+nil
+nil
+false
+false
+false
+nil
+[[1, nil], [2, nil]]
+[]
+[1, 2]
+[]
+[1, 2]
+[]
+[]
+[1, 2]
+[1, 2]
+[]
+[]
+[1.5]
+["x", "y"]
+false
+-1
+true
+false
+[]
+[]
+["a"]
+false
+nil
+false
+nil
+"{}"
+"[]"
+"x{}y[]z"
+{a: 1, b: 2}
+{1 => "x", 2 => "y"}
+[1]
+1
+{"k" => 2}
+[2, 4, 6]
+3
+[1, 2, 3]
+[1, 2, 3]

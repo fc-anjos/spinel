@@ -68,7 +68,15 @@ SPINEL = bin/spinel
 # GNU Make expands a rule's prerequisites immediately when the rule is read -- a
 # definition further down would expand to empty in `all`'s prereq list. The
 # build rule + rationale live further below (near the runtime archive).
+# The probe compiles AND LINKS a use of the API sp_openssl.c needs, not just
+# the header: a system with headers but no libssl, or one too old for
+# TLS_client_method, would otherwise pass the header check and fail at the
+# package's own link.
+OPENSSL_AVAILABLE := $(shell printf '\043include <openssl/ssl.h>\nint main(void){return TLS_client_method()!=0;}\n' > /tmp/sp_ossl_probe.c 2>/dev/null && $(CC) /tmp/sp_ossl_probe.c -lssl -lcrypto -o /tmp/sp_ossl_probe >/dev/null 2>&1 && echo yes)
 BUNDLED_NATIVE_OBJS = packages/json/sp_json.o packages/stringio/sp_stringio.o packages/strscan/sp_strscan.o packages/base64/sp_base64.o
+ifeq ($(OPENSSL_AVAILABLE),yes)
+BUNDLED_NATIVE_OBJS += packages/openssl/sp_openssl.o
+endif
 # Threaded variant of every bundled package object. A program that uses threads
 # compiles its TU (and links the runtime archive) with -DSP_THREADS, which makes
 # the runtime's per-worker globals thread-local; a package object built without
@@ -272,6 +280,19 @@ packages/json/sp_json_mt.o: packages/json/sp_json.c packages/json/sp_json.h \
                             lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/json packages/json/sp_json.c -o $@
 
+# openssl is glue over the SYSTEM libssl, so unlike the other package C it is
+# built only when the headers are installed: OPENSSL_AVAILABLE probes for
+# <openssl/ssl.h> and the object drops out of BUNDLED_NATIVE_OBJS when it is
+# missing, leaving `require "openssl"` an unsatisfiable require rather than a
+# link error. -lssl/-lcrypto reach the link line through openssl.rb's ffi_lib,
+# which is parsed only when a program requires it.
+packages/openssl/sp_openssl.o: packages/openssl/sp_openssl.c \
+                               lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
+packages/openssl/sp_openssl_mt.o: packages/openssl/sp_openssl.c \
+                                  lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
+
 # stringio is a native-bound spin package (Path B typed object): the struct,
 # every method, and the header live in the package; the compiler knows it only
 # through the native_* declarations in stringio.rb.
@@ -427,6 +448,12 @@ TEST_TARGETS := $(patsubst test/%.rb,build/test-results/%.ok,$(TESTS))
 # that breaks one must fail here, not at package-publish time. Targets are
 # namespaced pkg.<package>.<test>.ok to avoid colliding with test/ names.
 PKG_TESTS := $(wildcard packages/*/test/*.rb)
+# The openssl package is glue over the SYSTEM libssl, so its tests only exist
+# where the headers do -- the object drops out of BUNDLED_NATIVE_OBJS on the
+# same probe, and `require "openssl"` is then an unsatisfiable require.
+ifneq ($(OPENSSL_AVAILABLE),yes)
+PKG_TESTS := $(filter-out packages/openssl/test/%.rb,$(PKG_TESTS))
+endif
 pkg_of = $(word 2,$(subst /, ,$(1)))
 PKG_TEST_TARGETS := $(foreach t,$(PKG_TESTS),build/test-results/pkg.$(call pkg_of,$(t)).$(notdir $(t:.rb=)).ok)
 
@@ -545,6 +572,10 @@ re-lit-test: $(SPINEL)
 # then runs the suite. (The old incremental `test` + `retest` split is
 # gone — a stale `.ok` reading PASS was a recurring foot-gun.)
 test:
+	@if [ -z "$(TIMEOUT_BIN)" ]; then \
+	  echo "WARNING: no 'timeout'/'gtimeout' on PATH -- tests run with NO time limit."; \
+	  echo "         A hanging test will hang this run until the CI job's own limit."; \
+	fi
 	+@$(MAKE) --no-print-directory clean-test-results
 	+@$(MAKE) $(TEST_JOBS) --no-print-directory test-run
 
@@ -828,6 +859,10 @@ endif
 # which embeds the input path in #line directives, so a random tmpdir path
 # would give every run a fresh cache key and the cache would never hit.
 # The .c/.o are deleted after the link -- only the cache entry survives.
+# The generated C names the external libraries its ffi_lib declarations asked
+# for, as `/* SPINEL_LINK: -lfoo */` markers -- the same ones the spinel driver
+# scrapes when it drives cc itself. This rule drives cc directly, so it has to
+# read them too, or a package binding a system library (openssl) fails to link.
 define RUN_ONE_TEST
 @mkdir -p build/test-results
 @tmpdir=$$(mktemp -d /tmp/spinel-test.XXXXXX); \
@@ -848,11 +883,12 @@ $(SPINEL) "$<" $(SP_OV_FLAG) -c --no-line-map -o "$$cfile" 2>/dev/null && \
 { pchuse="$(PCH_USE_PLAIN)"; pchf="$(PCH_PLAIN)"; \
   if head -2 "$$cfile" | grep -q SP_TU_NO_POLY_RENDER; then pchuse="$(PCH_USE_NOPOLY)"; pchf="$(PCH_NOPOLY)"; fi; \
   [ -f "$$pchf" ] || pchuse=""; \
+  xlibs=$$(sed -n 's|^/\* SPINEL_LINK: \(.*\) \*/$$|\1|p' "$$cfile" | tr '\n' ' '); \
   if [ -n "$(TEST_SINGLE_INVOKE)" ]; then \
-    $(CC) $(CFLAGS) $(SP_OV_DEFINE) -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib "$$cfile" $(BUNDLED_NATIVE_OBJS) $(SP_RT_LIB) $(LDFLAGS) -lm $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
+    $(CC) $(CFLAGS) $(SP_OV_DEFINE) -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib "$$cfile" $(BUNDLED_NATIVE_OBJS) $(SP_RT_LIB) $(LDFLAGS) -lm $$xlibs $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
   else \
     $(CC) $(CFLAGS) $(SP_OV_DEFINE) -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib -c "$$cfile" -o "$$cfile.o" 2>/dev/null && \
-    $(CC) $(CFLAGS) "$$cfile.o" $(BUNDLED_NATIVE_OBJS) $(SP_RT_LIB) $(LDFLAGS) -lm $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
+    $(CC) $(CFLAGS) "$$cfile.o" $(BUNDLED_NATIVE_OBJS) $(SP_RT_LIB) $(LDFLAGS) -lm $$xlibs $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
   fi; }; \
 if [ $$? -eq 0 ]; then \
   if [ -f "$<.expected" ]; then \

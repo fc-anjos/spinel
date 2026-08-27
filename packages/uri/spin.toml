@@ -1,0 +1,6 @@
+[package]
+name = "uri"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# Pure Ruby, no carried C. Enough of URI for the HTTP client that uses it --
+# see uri.rb for what is deliberately absent.

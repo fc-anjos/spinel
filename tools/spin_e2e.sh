@@ -565,4 +565,131 @@ OUT=$("$SPIN" run plain --allow-native-build 2>&1)
 expect "native variant: single-threaded takes the plain object" "1" "$(echo "$OUT" | tail -1)"
 OUT=$("$SPIN" run threaded --allow-native-build 2>&1)
 expect "native variant: threaded takes the _mt object" "2" "$(echo "$OUT" | tail -1)"
+# --- `spin flags`: the handoff to a build spin does not drive (#4105) ---------
+# spin resolves the dependencies and warms the native cache, then prints the
+# flags; whoever is driving the build compiles with them. What it prints has to
+# be what `spin build` compiles with, so the check is that a hand-driven
+# compile produces the same program -- not that the text matches.
+cd "$WORK/app"
+rm -rf "$XDG_CACHE_HOME/spin/native"          # cold: `flags` must compile the carried C
+FLAGS=$("$SPIN" flags 2>/dev/null)
+# One line. A cold cache compiles here, and that progress used to print on
+# stdout, which would splice `cc fast/fast_ext.c` into the flag string.
+[ "$(printf '%s' "$FLAGS" | wc -l)" = "0" ] || fail "spin flags: progress leaked onto stdout"
+case "$FLAGS" in
+  --require-gate*) ;;
+  *) fail "spin flags: does not carry the require gate spin build compiles under" ;;
+esac
+# Absolute throughout: the caller's working directory is its own tree.
+case "$FLAGS" in
+  *" -I ."*|*" -I ../"*|*" --link ."*|*" --link ../"*)
+    fail "spin flags: relative path in [$FLAGS]" ;;
+esac
+case "$FLAGS" in
+  *--link*) ;;
+  *) fail "spin flags: carried-C object missing from [$FLAGS]" ;;
+esac
+SPINEL_BIN=$(dirname "$SPIN")/spinel
+"$SPINEL_BIN" $FLAGS bin/app.rb -o "$WORK/handoff" >/dev/null 2>&1 ||
+  fail "spin flags: hand-driven compile failed"
+expect "spin flags: hand-driven build matches spin build" \
+  "$("$SPIN" run 2>&1 | tail -1)" "$("$WORK/handoff" 2>&1 | tail -1)"
+
+# --- `[package] exclude`: C the package says is not part of this build --------
+# `.rb` enters by require, `.c` by presence, so an application whose repository
+# also holds a C program of its own has no other way to keep it out. Without
+# the field its main() collides with the generated one and the link fails.
+cd "$WORK"
+mkdir -p excl/bin
+printf 'puts "excluded ok"\n' > excl/bin/excl.rb
+cat > excl/standalone.c <<'EOF'
+#include <stdio.h>
+int main(void) { puts("a program of my own"); return 0; }
+EOF
+mkdir -p excl/cbits
+printf 'int cbits_unused(void) { return 7; }\n' > excl/cbits/helper.c
+cd excl
+printf '[package]\nname = "excl"\n' > spin.toml
+"$SPIN" build >/dev/null 2>&1 && fail "exclude: a main()-bearing .c linked in without complaint"
+printf '[package]\nname = "excl"\nexclude = ["standalone.c", "cbits"]\n' > spin.toml
+expect "exclude: named file and directory both pruned" "excluded ok" "$("$SPIN" run 2>&1 | tail -1)"
+
+# --- the runtime headers when spin and the compiler are not co-located (#4115) -
+# `spin install` puts spin in ~/.local/bin with no spinel beside it, and package
+# C includes "spinel/runtime.h". spin gave up locating the headers the moment
+# the compiler came from PATH, so -I <spinel>/lib vanished and every package
+# carrying C failed on a missing runtime.h -- while the same package built fine
+# from a tree where the two sat together.
+cd "$WORK"
+mkdir -p lonely/bin
+cp "$SPIN" lonely/bin/spin                     # spin alone; no spinel beside it
+cd "$WORK/app"
+OUT=$(PATH="$(dirname "$SPIN"):$PATH" SPIN_NO_NATIVE_CACHE=1 "$WORK/lonely/bin/spin" flags 2>&1) || true
+case "$OUT" in
+  *"runtime.h"*|*"native compile failed"*)
+    fail "headers not found when spin is not beside the compiler: [$OUT]" ;;
+esac
+case "$OUT" in
+  *--link*) ;;
+  *) fail "PATH-resolved compiler: carried C did not build [$OUT]" ;;
+esac
+
+# ... and through a SYMLINK, which is what `spin install` leaves behind: a link
+# in ~/.local/bin pointing into the install tree, with no lib beside the link.
+# PATH hands back the link itself, so the walk for the headers started from the
+# wrong parent and found nothing (#4126).
+#
+# The package has to include "spinel/runtime.h" for this to test anything --
+# the carried C above includes only <stdint.h>, so it compiles with or without
+# the runtime include path, and a check written against it passes either way.
+cd "$WORK"
+mkdir -p spinel-rthdr linked/bin
+printf '[package]\nname = "rthdr"\n' > spinel-rthdr/spin.toml
+cat > spinel-rthdr/rthdr.rb <<'EOF'
+module Rthdr
+  native_lib "rthdr"
+  native_func :len2, [:string], :int, "sp_rthdr_len2"
+end
+EOF
+cat > spinel-rthdr/sp_rthdr.c <<'EOF'
+#include "spinel/runtime.h"
+sp_int sp_rthdr_len2(const char *s) { return (sp_int)sp_str_byte_len(s) * 2; }
+EOF
+ln -sf "$SPIN" linked/bin/spin
+ln -sf "$(dirname "$SPIN")/spinel" linked/bin/spinel
+[ -f "$(dirname "$SPIN")/spinel_rbs_extract" ] && ln -sf "$(dirname "$SPIN")/spinel_rbs_extract" linked/bin/spinel_rbs_extract
+mkdir -p rtapp/bin
+printf '[package]\nname = "rtapp"\n\n[dependencies]\nrthdr = { path = "../spinel-rthdr" }\n' > rtapp/spin.toml
+printf 'require "rthdr"\nputs Rthdr.len2("abc")\n' > rtapp/bin/rtapp.rb
+cd "$WORK/rtapp"
+# SPIN_NO_NATIVE_CACHE, or a cached object is reused and nothing is compiled --
+# exactly the masking #4115 complained about, and it made this check pass
+# against the bug the first time it was written.
+# `|| true`: spin exits non-zero when the compile fails, and under set -e the
+# assignment itself would then end the script before the check below could
+# say what went wrong -- a reproduction that dies silently.
+OUT=$(PATH="$WORK/linked/bin:$PATH" SPIN_NO_NATIVE_CACHE=1 spin flags 2>&1) || true
+case "$OUT" in
+  *"runtime.h"*|*"native compile failed"*)
+    fail "runtime headers not found through a symlinked install: [$OUT]" ;;
+esac
+expect "symlinked install builds and runs" "6" \
+  "$(PATH="$WORK/linked/bin:$PATH" spin run 2>&1 | tail -1)"
+cd "$WORK/app"
+
+# --- the native cache is relocatable and skippable (#4115) --------------------
+# A run behaves differently depending on whether an object is already cached,
+# which is what you least want while working out why a build differs.
+rm -rf "$WORK/ncache"
+OUT=$(SPIN_NATIVE_CACHE="$WORK/ncache" "$SPIN" flags 2>/dev/null)
+case "$OUT" in
+  *"$WORK/ncache"*) ;;
+  *) fail "SPIN_NATIVE_CACHE ignored: [$OUT]" ;;
+esac
+# Cached: the second run compiles nothing. Not cached: it compiles again.
+CC1=$(SPIN_NATIVE_CACHE="$WORK/ncache" "$SPIN" flags 2>&1 >/dev/null | grep -c "^cc " || true)
+expect "native cache reused on the second run" "0" "$CC1"
+CC2=$(SPIN_NATIVE_CACHE="$WORK/ncache" SPIN_NO_NATIVE_CACHE=1 "$SPIN" flags 2>&1 >/dev/null | grep -c "^cc " || true)
+[ "$CC2" -ge 1 ] || fail "SPIN_NO_NATIVE_CACHE did not force a rebuild"
+
 echo "spin-e2e: ALL GREEN"

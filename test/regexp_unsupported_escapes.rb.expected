@@ -12,3 +12,5 @@ bare-p | "p"
 pL | "pL"
 class-R | "R"
 class-K | "K"
+class-p | RegexpError
+class-P-neg | RegexpError
