@@ -1505,12 +1505,14 @@ const char *sp_MatchData_post_match(sp_MatchData *m) {SP_GC_ROOT(m);
   sp_str_set_len(b, len);
   return sp_str_bin_like(m->source, b);
 }
-void sp_re_default_error_handler(const char *msg) {SP_GC_ROOT_STR(msg);
+void sp_re_default_error_handler(const char *msg) {
   /* msg points at the regex compiler's stack buffer. sp_raise_cls stores
      the pointer and longjmps past that frame, leaving it dangling -- copy
      to a GC-managed string first (mirrors sp_re_startup_error_handler).
      gcc happened to leave the stack intact; clang reused it, so e.message
-     read garbage (regexp_error_catchable). */
+     read garbage (regexp_error_catchable). The copy is rooted, the buffer
+     not: it has no String header, and a collection the copy's allocation
+     starts would read the byte in front of it for one. */
   if (msg) {
     size_t n = strlen(msg);
     char *buf = sp_str_alloc_raw(n + 1);
@@ -1519,6 +1521,7 @@ void sp_re_default_error_handler(const char *msg) {SP_GC_ROOT_STR(msg);
     sp_str_set_len(buf, (size_t)n);
     msg = buf;
   }
+  SP_GC_ROOT_STR(msg);
   sp_raise_cls("RegexpError", msg);
 }
 
