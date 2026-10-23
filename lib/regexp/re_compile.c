@@ -5258,19 +5258,26 @@ compute_anchor(mrb_state *mrb, const re_inst *code, uint32_t code_len)
    whose iterations all consume never triggers the handling the mark turns
    on.
 
+   What the walk does not enter is the pattern between goal and its RE_MATCH
+   (`limit`): the code after a loop. A path out there comes back into the
+   loop only through its head, which the walk marked first, or through a
+   trampoline, which stays open. Walking it found nothing, and cost a walk of
+   the rest of the program for every loop: a*{400}*{400} unrolls to 160,000
+   loops whose tails all match empty, and took a minute to compile.
+
    `stack` holds the branch of each fork the walk has still to take, newest
    first, which is the order following one in a call of its own gave. A pc
    goes on it only where the walk marked a fork, and a mark is made once,
    so the caller's code_len entries are room enough for any pattern. */
 static mrb_bool
 epsilon_path(const re_inst *code, uint32_t code_len, uint32_t pc, uint32_t goal,
-             uint32_t *seen, uint32_t mark, uint32_t *stack)
+             uint32_t limit, uint32_t *seen, uint32_t mark, uint32_t *stack)
 {
   uint32_t top = 0;
 
   for (;;) {
     while (pc != goal) {
-      if (pc >= code_len || seen[pc] == mark) goto next;
+      if (pc >= code_len || seen[pc] == mark || (pc > goal && pc < limit)) goto next;
       seen[pc] = mark;
       switch (code[pc].op) {
       case RE_SAVE:
@@ -5334,6 +5341,8 @@ mark_empty_loops(mrb_state *mrb, re_inst *code, uint32_t code_len)
   uint32_t *seen = (uint32_t*)(delta + n);
   uint32_t *stack = seen + n;  /* the forks epsilon_path() has yet to take */
   uint32_t mark = 0;
+  uint32_t limit = 0;  /* the RE_MATCH: past it, the trampolines */
+  while (limit < code_len && code[limit].op != RE_MATCH) limit++;
 
   for (uint32_t pc = 0; pc < code_len; pc++) {
     re_inst in = code[pc];
@@ -5350,7 +5359,7 @@ mark_empty_loops(mrb_state *mrb, re_inst *code, uint32_t code_len)
     if (in.op != RE_JMP && in.op != RE_SPLIT && in.op != RE_SPLITNG) continue;
     code[pc].a = 0;                /* this pass owns `a` on the edge opcodes */
     if (in.offset > pc) continue;  /* forward edge: alternation, not a loop */
-    if (!epsilon_path(code, code_len, in.offset, pc, seen, ++mark, stack)) continue;
+    if (!epsilon_path(code, code_len, in.offset, pc, limit, seen, ++mark, stack)) continue;
     code[pc].a = 1;
     if (in.op == RE_JMP) {
       /* The head was passed earlier in this scan, so its mark stays. */
