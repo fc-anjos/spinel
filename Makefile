@@ -11,6 +11,8 @@
 #   make gate         Full pre-push: test || bench || optcarrot (reuses the
 #                     passes of unchanged programs, see RUN_ONE_TEST)
 #   make gate-full    The same with GATE_CACHE=0: every program built and run
+#   make fuzz         Build the libFuzzer harnesses (test/fuzz; needs clang)
+#   make fuzz-run     Run each for FUZZ_TIME seconds (default 60)
 #   make clean        Remove built binaries
 
 # COPT: optimization level override. Default -O2 for release builds.
@@ -854,6 +856,50 @@ rt-san-check: $(SPINEL) $(SPINEL_TIMEOUT) $(SP_RT_SAN_LIB) $(SP_RT_MT_SAN_LIB) $
 	  RT_SAN_SKIP="$(filter-out $(TESTS) $(PKG_TESTS),$(wildcard test/*.rb packages/*/test/*.rb))" \
 	  tools/rt_san_check.sh $(RT_SAN_FILES)
 
+# ---- libFuzzer harnesses (test/fuzz) ----
+# `make fuzz` builds one libFuzzer binary per entry of test/fuzz/kernel.rb
+# into build/fuzz: the kernel emitted as an --ext library, test/fuzz/harness.c
+# as its host, and the runtime archive built by the rt-san rules above into a
+# tree of its own, with libFuzzer's coverage added to the sanitizers. Needs
+# clang and its compiler-rt (libclang-rt-dev on Debian/Ubuntu).
+# `make fuzz-run FUZZ_TIME=60` runs each for that many seconds from the seeds
+# in test/fuzz/corpus/<target>, growing build/fuzz/corpus-<target>; a finding
+# is written to build/fuzz/<target>-crash-*. Not a gate leg.
+FUZZ_CC ?= clang
+FUZZ_DIR = build/fuzz
+FUZZ_TARGETS = marshal unpack regexp
+FUZZ_ENTRIES = FuzzKernel.marshal,FuzzKernel.unpack,FuzzKernel.regexp
+FUZZ_TIME ?= 60
+FUZZ_SAN = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+FUZZ_RT_LIB = $(FUZZ_DIR)/rt/libspinel_rt.a
+FUZZ_BINS = $(addprefix $(FUZZ_DIR)/fuzz_,$(FUZZ_TARGETS))
+# The archive is the rt-san one with another directory and flags, so it is
+# made by a nested make over the same rules rather than a copy of them.
+.PHONY: fuzz fuzz-run fuzz-rt
+fuzz-rt:
+	@$(MAKE) --no-print-directory CC=$(FUZZ_CC) RT_SAN_DIR=$(FUZZ_DIR)/rt \
+	  RT_SAN_FLAGS="$(FUZZ_SAN) -fsanitize=fuzzer-no-link" $(FUZZ_RT_LIB)
+$(FUZZ_DIR)/k.c: test/fuzz/kernel.rb $(SPINEL)
+	@mkdir -p $(@D)
+	$(SPINEL) $< -c --no-line-map --ext-init Init_fuzz_kernel \
+	  --ext-entry $(FUZZ_ENTRIES) -o $@ >/dev/null
+$(FUZZ_DIR)/fuzz_%: test/fuzz/harness.c $(FUZZ_DIR)/k.c fuzz-rt
+	$(FUZZ_CC) $(FUZZ_SAN) -fsanitize=fuzzer -w -Ilib -I$(FUZZ_DIR) -DFUZZ_TARGET=$* \
+	  $< $(FUZZ_DIR)/k.c $(FUZZ_RT_LIB) $(LDFLAGS) -lm -o $@
+fuzz: $(FUZZ_BINS)
+# The runtime is garbage-collected, so what LeakSanitizer would report at
+# exit is the collector's live heap, not a leak.
+fuzz-run: fuzz
+	@fail=0; for t in $(FUZZ_TARGETS); do \
+	  mkdir -p $(FUZZ_DIR)/corpus-$$t; \
+	  echo "fuzz $$t: $(FUZZ_TIME)s"; \
+	  ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+	  $(FUZZ_DIR)/fuzz_$$t -max_total_time=$(FUZZ_TIME) -timeout=10 -rss_limit_mb=2048 \
+	    -max_len=4096 -print_final_stats=0 -artifact_prefix=$(FUZZ_DIR)/$$t- \
+	    $(FUZZ_DIR)/corpus-$$t test/fuzz/corpus/$$t > $(FUZZ_DIR)/$$t.log 2>&1 || \
+	    { echo "fuzz $$t: FINDING (see $(FUZZ_DIR)/$$t.log)"; fail=1; }; \
+	done; exit $$fail
+
 # ---- wasm32-wasi runtime archive ----
 # `spinel --target=wasm32-wasi` links lib/wasm32-wasi/libspinel_rt.a, the
 # same sources compiled by the wasi-sdk's clang (WASI_SDK, or the sdk's own
@@ -1541,6 +1587,10 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	if $(SPINEL) "$$tmp/mut.rb" -c --no-line-map --ext-init spx_i --ext-entry M.eat -o "$$tmp/m.c" >"$$tmp/m.out" 2>&1; then \
 	  echo "ext-test: FAIL (a parameter mutation compiled, R4)"; ok=0; \
 	else grep -q "mutates its parameter" "$$tmp/m.out" || { echo "ext-test: FAIL (R4 refused without saying why)"; sed -n 1,3p "$$tmp/m.out"; ok=0; }; fi; \
+	if $(SPINEL) test/ext/marshal_kernel.rb -c --no-line-map --ext-init Init_ext_marshal \
+	    --ext-entry ExtMarshal.load_size -o "$$tmp/mk.c" >/dev/null 2>&1 && \
+	  $(CC) -c -O0 -w -Ilib -I"$$tmp" "$$tmp/mk.c" -o "$$tmp/mk.o" 2>"$$tmp/cc.err"; then :; \
+	else echo "ext-test: FAIL (a kernel using Marshal did not emit or compile)"; sed -n 1,3p "$$tmp/cc.err"; ok=0; fi; \
 	if [ $$ok -eq 1 ]; then \
 	  grep -q "int main" "$$tmp/k.c" && { echo "ext-test: FAIL (main leaked into the library)"; ok=0; }; \
 	  grep -q "toplevel ran" "$$tmp/k.c" || { echo "ext-test: FAIL (toplevel missing from init)"; ok=0; }; \
