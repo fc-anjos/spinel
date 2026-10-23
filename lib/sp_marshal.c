@@ -340,7 +340,15 @@ void sp_marshal_mark_active(void) {
     for (int i = 0; i < r->nobj; i++) sp_mark_rbval(r->objs[i]);
   }
 }
-static unsigned char sp_mar_rb(sp_mar_rd *r) { return r->pos < r->len ? (unsigned char)r->s[r->pos++] : 0; }
+/* Reading past the end is CRuby's "marshal data too short": a record's
+   length or count comes from the stream, so a short stream that claims more
+   stops here rather than reading zeros for as long as the claim says. */
+static void sp_mar_short(void) { mar_raise("ArgumentError", "marshal data too short"); }
+static unsigned char sp_mar_rb(sp_mar_rd *r) {
+  if (r->pos < r->len) return (unsigned char)r->s[r->pos++];
+  sp_mar_short();
+  return 0;
+}
 static long sp_mar_rlong(sp_mar_rd *r) {
   int c = (signed char)sp_mar_rb(r);
   if (c == 0) return 0;
@@ -361,6 +369,8 @@ static long sp_mar_rlong(sp_mar_rd *r) {
 }
 static char *sp_mar_rstr(sp_mar_rd *r, long n) {
   if (n < 0) n = 0;
+  /* checked before the allocation, which the claimed length would size */
+  if ((size_t)n > r->len - r->pos) sp_mar_short();
   char *out = sp_str_alloc_raw((size_t)n + 1);
   for (long i = 0; i < n; i++) out[i] = (char)sp_mar_rb(r);
   out[n] = 0;
@@ -545,6 +555,7 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       char sign = (char)sp_mar_rb(r);
       long nwords = sp_mar_rlong(r);
       size_t nbytes = (size_t)(nwords > 0 ? nwords : 0) * 2;
+      if (nwords > 0 && (size_t)nwords > (r->len - r->pos) / 2) sp_mar_short();
       unsigned char *buf = (unsigned char *)malloc(nbytes ? nbytes : 1);
       for (size_t i = 0; i < nbytes; i++) buf[i] = sp_mar_rb(r);
       sp_Bigint *bn = sp_bigint_from_le_bytes(sign == '-', buf, nbytes);
